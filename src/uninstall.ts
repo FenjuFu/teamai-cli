@@ -19,9 +19,10 @@ import {
   TEAMAI_ENV_START,
   TEAMAI_ENV_END,
   getTeamaiHome,
-  getManagedHooksPath,
   managedMcpManifestPath,
   resolveBaseDir,
+  resolveHookScope,
+  resolveLegacyProjectHookScope,
   scopedToolPaths,
   type GlobalOptions,
   type TeamaiConfig,
@@ -30,6 +31,7 @@ import {
   type ManagedMcpManifest,
 } from './types.js';
 import { BUILTIN_RULE_NAMES } from './builtin-rules.js';
+import { ruleStemFromFilename } from './resources/rule-format.js';
 import { BUILTIN_AGENT_NAMES } from './builtin-agents.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import {
@@ -55,8 +57,9 @@ interface UninstallOptions extends GlobalOptions {
 }
 
 interface RemovalPlan {
-  /** Tool settings files that contain teamai hooks. */
-  hookFiles: Array<{ path: string; tool: string }>;
+  /** Tool settings files that contain teamai hooks (each with the manifest that
+   *  recorded its team hooks — HOME/user or a legacy <projectRoot>/project one). */
+  hookFiles: Array<{ path: string; tool: string; manifestPath: string }>;
   /** OpenClaw-style hook dirs (<base>/.<tool>/hooks) holding teamai HOOK.md+handler.ts. */
   openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
   /** OpenCode teamai plugin files (.opencode/plugin/teamai-*.ts) to delete. */
@@ -79,8 +82,6 @@ interface RemovalPlan {
   teamaiHome: string;
   /** Whether teamaiHome exists on disk. */
   teamaiHomeExists: boolean;
-  /** Managed-hooks manifest path (for team-hook cleanup). */
-  managedHooksPath: string;
   /** Whether shared resources (docs / ~/.teamai / shell profile) are part of this removal. */
   includeShared: boolean;
   /** Whether this removal targets Hermes (clears its SOUL.md block + config.yaml hook). */
@@ -91,7 +92,7 @@ interface RemovalPlan {
 
 /** Per-tool findings collected during discovery (tool-specific resources only). */
 interface ToolResources {
-  hookFiles: Array<{ path: string; tool: string }>;
+  hookFiles: Array<{ path: string; tool: string; manifestPath: string }>;
   openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
   opencodeHookScopes: Array<{ baseDir: string; scope: Scope }>;
   claudeMdFiles: string[];
@@ -220,7 +221,7 @@ async function discoverToolResources(
   teamSkillNames: Set<string>,
   teamRuleNames: Set<string>,
   teamAgentNames: Set<string>,
-  managedHooksPath: string,
+  hookTargets: Array<{ baseDir: string; manifestPath: string }>,
   scope: Scope,
 ): Promise<ToolResources> {
   const res: ToolResources = {
@@ -247,19 +248,31 @@ async function discoverToolResources(
       }
     }
   } else if (toolPath.settings) {
-    const settingsPath = path.join(baseDir, toolPath.settings);
-    if (await pathExists(settingsPath)
-      && (await hasTeamaiHooks(settingsPath, tool, managedHooksPath)
-        || isEmptyHooksResidue(await readJson<Record<string, unknown>>(settingsPath)))) {
-      res.hookFiles.push({ path: settingsPath, tool });
+    // Hooks live where resolveHookScope injected them (HOME for a non-self
+    // project scope, per #370) — plus any legacy <projectRoot> copy. Scan every
+    // target and tag each match with the manifest that recorded its team hooks,
+    // so removal strips the right entries at each location.
+    for (const { baseDir: hookBaseDir, manifestPath } of hookTargets) {
+      const settingsPath = path.join(hookBaseDir, toolPath.settings);
+      if (await pathExists(settingsPath)
+        && (await hasTeamaiHooks(settingsPath, tool, manifestPath)
+          || isEmptyHooksResidue(await readJson<Record<string, unknown>>(settingsPath)))) {
+        res.hookFiles.push({ path: settingsPath, tool, manifestPath });
+      }
     }
   } else {
     // OpenClaw-style agents (no settings file) inject a HOOK.md + handler.ts
-    // under <hooksDir>/<OPENCLAW_HOOK_DIR>. Check both the default path and
-    // the OPENCLAW_STATE_DIR override to cover imate container environments.
+    // under <hooksDir>/<OPENCLAW_HOOK_DIR>. Check the default path, the
+    // OPENCLAW_STATE_DIR override (imate containers), and the resolved
+    // workspace dir — injection now targets `<workspace>/hooks`, so teardown
+    // must cover it too, otherwise the hook is orphaned on uninstall.
     const defaultHooksDir = path.join(baseDir, `.${tool}`, 'hooks');
     const resolvedHooksDir = resolveOpenClawHooksDir(tool);
     const dirsToCheck = new Set([defaultHooksDir, resolvedHooksDir]);
+    const workspaceDir = await resolveOpenclawWorkspaceDir();
+    if (workspaceDir) {
+      dirsToCheck.add(path.join(workspaceDir, 'hooks'));
+    }
     for (const hooksDir of dirsToCheck) {
       if (await pathExists(path.join(hooksDir, OPENCLAW_HOOK_DIR))) {
         res.openclawHookDirs.push({ hooksDir, tool });
@@ -302,8 +315,10 @@ async function discoverToolResources(
     if (await pathExists(rulesDir)) {
       const files = await listFilesRecursive(rulesDir);
       for (const file of files) {
-        if (!file.endsWith('.md')) continue;
-        const ruleName = file.replace(/\.md$/, '');
+        // Cursor's copies are `.mdc`; match by stem so both extensions are
+        // collected and uninstall does not leave team rules behind.
+        const ruleName = ruleStemFromFilename(file);
+        if (ruleName === null) continue;
         if (teamRuleNames.has(ruleName)) {
           res.ruleFiles.push(path.join(rulesDir, file));
         }
@@ -365,8 +380,15 @@ async function buildRemovalPlan(
     } catch { /* best effort */ }
   }
 
-  // Discover per-tool resources
-  const managedHooksPath = getManagedHooksPath(localConfig.scope, localConfig.projectRoot);
+  // Discover per-tool resources. Hooks are discovered at the injection target
+  // resolveHookScope reports (HOME + user manifest for a non-self project scope,
+  // #370) — the previous code scanned <projectRoot>, so uninstall silently left
+  // the SessionStart hook live in HOME forever. A legacy <projectRoot> copy from
+  // a pre-#370 CLI is swept too, tagged with its project manifest.
+  const primaryHookScope = resolveHookScope(localConfig);
+  const hookTargets = [primaryHookScope];
+  const legacyHookScope = resolveLegacyProjectHookScope(localConfig);
+  if (legacyHookScope) hookTargets.push(legacyHookScope);
   const perTool = new Map<string, ToolResources>();
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     perTool.set(
@@ -378,7 +400,7 @@ async function buildRemovalPlan(
         teamSkillNames,
         teamRuleNames,
         teamAgentNames,
-        managedHooksPath,
+        hookTargets,
         localConfig.scope,
       ),
     );
@@ -416,7 +438,6 @@ async function buildRemovalPlan(
     docsDir: null,
     teamaiHome,
     teamaiHomeExists: includeShared && await pathExists(teamaiHome),
-    managedHooksPath,
     includeShared,
     hermesCleanup: toolsToMerge.includes('hermes'),
     scope: localConfig.scope,
@@ -607,10 +628,12 @@ async function teardownPlugins(): Promise<void> {
 }
 
 async function executeRemoval(plan: RemovalPlan): Promise<void> {
-  // (a) Remove hooks from tool settings (built-in A + team B via the manifest)
-  for (const { path: settingsPath, tool } of plan.hookFiles) {
+  // (a) Remove hooks from tool settings (built-in A + team B via the manifest).
+  // Each entry carries the manifest for its own location (HOME/user or a legacy
+  // <projectRoot>/project copy), so team hooks are stripped correctly at both.
+  for (const { path: settingsPath, tool, manifestPath } of plan.hookFiles) {
     try {
-      await reconcileHooks(settingsPath, tool, [], { removeAll: true, manifestPath: plan.managedHooksPath });
+      await reconcileHooks(settingsPath, tool, [], { removeAll: true, manifestPath });
     } catch (e) {
       log.warn(`Failed to remove hooks from ${settingsPath}: ${(e as Error).message}`);
     }

@@ -1,4 +1,5 @@
 import path from 'node:path';
+import YAML from 'yaml';
 import { ResourceHandler } from './base.js';
 import type { ResourceItem, ResourceItemStatus, TeamaiConfig, LocalConfig } from '../types.js';
 import { resolveBaseDir, getPushignorePath, isAgentDisabled, scopedToolPaths } from '../types.js';
@@ -6,13 +7,24 @@ import { listDirs, pathExists, copyDir, remove, dirTeamSubsetEqual, getDirLatest
 import { log } from '../utils/logger.js';
 import { BUILTIN_SKILL_NAMES } from '../builtin-skills.js';
 import { resolveOpenclawWorkspaceDir } from '../openclaw-hooks.js';
+import { getHermesHome } from '../hermes-home.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces } from '../roles.js';
 import { assertWithinRoot } from '../utils/path-safety.js';
+import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js';
 
 /** File name used to track who has contributed (pushed) a skill. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
 const SKILL_MD = 'SKILL.md';
-const FRONTMATTER_REGEX = /^---\n[\s\S]*?\n---/;
+
+/** Add fields immediately before the closing delimiter without reformatting existing YAML. */
+function appendFrontmatterFields(raw: string, fields: Record<string, string>): string {
+  const eol = raw.includes('\r\n') ? '\r\n' : '\n';
+  const yaml = YAML.stringify(fields).trimEnd().replace(/\n/g, eol);
+  return raw.replace(
+    /(\r?\n---[ \t]*)(\r?\n|$)$/,
+    (_match, closing: string, trailing: string) => `${eol}${yaml}${closing}${trailing}`,
+  );
+}
 
 /**
  * Ensure a SKILL.md file has valid YAML frontmatter with `name` and `description`.
@@ -28,38 +40,35 @@ export async function ensureSkillFrontmatter(skillDir: string, skillName: string
   const content = await readFileSafe(skillMdPath);
   if (!content) return false;
 
-  const fmMatch = content.match(FRONTMATTER_REGEX);
+  const { data, body, raw, valid } = splitFrontmatter(content);
 
-  if (!fmMatch) {
+  if (!raw) {
     // No frontmatter at all — derive description from first heading or first non-empty line
-    const description = extractDescriptionFromContent(content, skillName);
-    const frontmatter = `---\nname: ${skillName}\ndescription: ${description}\n---\n`;
-    const newContent = frontmatter + (content.startsWith('\n') ? content : '\n' + content);
+    const description = extractDescriptionFromContent(body, skillName);
+    const newContent = stringifyFrontmatter({ name: skillName, description }, body);
     await writeFile(skillMdPath, newContent);
     log.debug(`Injected YAML frontmatter into ${skillName}/SKILL.md`);
     return true;
   }
 
+  if (!valid) {
+    log.warn(`Could not repair malformed frontmatter in ${skillName}/SKILL.md; leaving it unchanged`);
+    return false;
+  }
+
   // Frontmatter exists — check for missing fields
-  const fmBlock = fmMatch[0];
-  const fmBody = fmBlock.slice(4, fmBlock.length - 4); // strip leading/trailing ---\n
-  const hasName = /^name:\s*.+/m.test(fmBody);
-  const hasDescription = /^description:\s*.+/m.test(fmBody);
+  const hasName = typeof data['name'] === 'string' && String(data['name']).trim() !== '';
+  const hasDescription = typeof data['description'] === 'string' && String(data['description']).trim() !== '';
 
   if (hasName && hasDescription) return false; // Already complete
 
-  const lines = fmBody.split('\n');
-  if (!hasName) {
-    lines.push(`name: ${skillName}`);
-  }
-  if (!hasDescription) {
-    const restContent = content.slice(fmMatch[0].length);
-    const description = extractDescriptionFromContent(restContent, skillName);
-    lines.push(`description: ${description}`);
-  }
+  const missingFields: Record<string, string> = {};
+  if (!hasName) missingFields.name = skillName;
+  if (!hasDescription) missingFields.description = extractDescriptionFromContent(body, skillName);
 
-  const newFrontmatter = `---\n${lines.join('\n')}\n---`;
-  const newContent = content.replace(FRONTMATTER_REGEX, newFrontmatter);
+  // Preserve existing comments, quoting, key order, and line endings. Re-serializing
+  // the whole block would make an unrelated metadata repair unnecessarily lossy.
+  const newContent = appendFrontmatterFields(raw, missingFields) + body;
   await writeFile(skillMdPath, newContent);
   log.debug(`Added missing frontmatter fields to ${skillName}/SKILL.md`);
   return true;
@@ -442,6 +451,8 @@ export class SkillsHandler extends ResourceHandler {
           continue;
         }
         dest = path.join(wsDir, 'skills', item.name);
+      } else if (tool === 'hermes') {
+        dest = path.join(getHermesHome(), 'skills', item.name);
       } else {
         if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) {
           log.debug(`Skipping skill sync for ${tool}: tool not installed`);

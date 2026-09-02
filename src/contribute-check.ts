@@ -2,10 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { log } from './utils/logger.js';
-import { readJson, writeJson, ensureDir } from './utils/fs.js';
-import { readEvents, aggregateSessionMetrics } from './dashboard-collector.js';
+import { readJson, writeJson, writeJsonAtomic, ensureDir } from './utils/fs.js';
+import { readEvents, aggregateSessionMetrics, scanTranscriptStop } from './dashboard-collector.js';
 import { readRecallQuality } from './recall-quality.js';
 import { deriveSessionId } from './utils/session-id.js';
+import { resolveHookCwd } from './utils/hook-cwd.js';
 import { redactWithEnv } from './utils/redact.js';
 import type { ContributeState, DashboardEvent, SessionFriction } from './types.js';
 import {
@@ -125,6 +126,28 @@ function getSessionPath(sessionId: string): string {
   );
 }
 
+/**
+ * Get the sidecar used for vote nudges. Keep it separate from the contribute
+ * state JSON because the Stop handlers run concurrently and independently.
+ */
+function getPendingVotesHintPath(sessionId: string): string {
+  return path.join(
+    getUserHome(),
+    '.teamai',
+    'sessions',
+    `${sanitizeSessionId(sessionId)}.votes-hint.json`,
+  );
+}
+
+function getVotesNudgeMarkerPath(sessionId: string): string {
+  return path.join(
+    getUserHome(),
+    '.teamai',
+    'sessions',
+    `${sanitizeSessionId(sessionId)}.votes-nudged.json`,
+  );
+}
+
 /** Default empty state for a new session. */
 function defaultState(): ContributeState {
   return {
@@ -151,6 +174,7 @@ export async function readContributeState(sessionId: string): Promise<Contribute
         promptSummary: typeof raw.promptSummary === 'string'
           ? normalizePromptSummary(raw.promptSummary)
           : undefined,
+        pendingHint: typeof raw.pendingHint === 'string' ? raw.pendingHint : undefined,
       };
     }
     return defaultState();
@@ -335,7 +359,11 @@ export function applyPhase2Adjustments(
 }
 
 /** Read STDIN and extract sessionId from hook JSON. */
-async function readStdinAndDeriveSession(): Promise<{ sessionId: string; cwd?: string } | null> {
+async function readStdinAndDeriveSession(): Promise<{
+  sessionId: string;
+  cwd?: string;
+  transcriptPath?: string;
+} | null> {
   if (process.stdin.isTTY) return null;
 
   const chunks: Buffer[] = [];
@@ -349,8 +377,11 @@ async function readStdinAndDeriveSession(): Promise<{ sessionId: string; cwd?: s
     const hookData = JSON.parse(raw) as Record<string, unknown>;
     // Derive session ID: session_id field > env > PID+cwd fallback
     const sessionId = deriveSessionId(hookData, { includeCwd: true });
-    const cwd = typeof hookData.cwd === 'string' ? hookData.cwd : undefined;
-    return { sessionId, cwd };
+    const cwd = resolveHookCwd(hookData);
+    const transcriptPath = typeof hookData.transcript_path === 'string'
+      ? hookData.transcript_path
+      : undefined;
+    return { sessionId, cwd, transcriptPath };
   } catch {
     return null;
   }
@@ -369,21 +400,36 @@ function countUniqueTools(events: DashboardEvent[]): number {
 /**
  * Extract friction signals for a session from its events.
  *
- * - interrupt / toolReject / toolError: from the latest Stop event's interventions
- *   snapshot (idempotent full total; toolError absent on pre-existing events → 0).
+ * - interrupt / toolReject / toolError: prefer the freshly-scanned transcript
+ *   results (`transcriptFriction`) when provided. These three signals normally
+ *   live on the latest Stop event's interventions snapshot, but that Stop event
+ *   is written asynchronously by a detached background process and may not be
+ *   flushed to events.jsonl yet when this check runs — so a live transcript scan
+ *   eliminates the cross-process race. When `transcriptFriction` is absent
+ *   (backward compatibility / no transcript path), fall back to the latest Stop
+ *   event's interventions snapshot (idempotent full total; toolError absent on
+ *   pre-existing events → 0).
  * - correction: derived by aggregateSessionMetrics from the stop→prompt_submit
  *   pattern (not present on any single event), so we reuse it rather than re-scan.
  */
-function extractFriction(events: DashboardEvent[], sessionId: string): SessionFriction {
+function extractFriction(
+  events: DashboardEvent[],
+  sessionId: string,
+  transcriptFriction?: { interrupt: number; toolReject: number; toolError: number },
+): SessionFriction {
   let interrupt = 0;
   let toolReject = 0;
   let toolError = 0;
-  for (const e of events) {
-    if (e.type === 'stop' && e.interventions) {
-      // Latest Stop wins (snapshots are cumulative & idempotent).
-      interrupt = e.interventions.interrupt;
-      toolReject = e.interventions.toolReject;
-      toolError = e.interventions.toolError ?? 0;
+  if (transcriptFriction) {
+    ({ interrupt, toolReject, toolError } = transcriptFriction);
+  } else {
+    for (const e of events) {
+      if (e.type === 'stop' && e.interventions) {
+        // Latest Stop wins (snapshots are cumulative & idempotent).
+        interrupt = e.interventions.interrupt;
+        toolReject = e.interventions.toolReject;
+        toolError = e.interventions.toolError ?? 0;
+      }
     }
   }
   const correction = aggregateSessionMetrics(events).get(sessionId)?.correction ?? 0;
@@ -484,6 +530,8 @@ function buildHint({ friction, promptSummary, isKnowledgeGap }: HintContext): st
 export async function contributeCheckForSession(
   sessionId: string,
   cwd?: string,
+  transcriptPath?: string,
+  stashInsteadOfReturn = false,
 ): Promise<{ hint: string | null }> {
   const state = await readContributeState(sessionId);
   const now = Date.now();
@@ -539,7 +587,16 @@ export async function contributeCheckForSession(
   } else {
     const allEvents = await readEvents();
     const sessionEvents = allEvents.filter((e) => e.sessionId === sessionId);
-    friction = extractFriction(sessionEvents, sessionId);
+    if (transcriptPath) {
+      const scan = await scanTranscriptStop(transcriptPath, { frictionOnly: true });
+      friction = extractFriction(sessionEvents, sessionId, {
+        interrupt: scan.interrupt,
+        toolReject: scan.toolReject,
+        toolError: scan.toolError,
+      });
+    } else {
+      friction = extractFriction(sessionEvents, sessionId);
+    }
     promptSummary = extractPromptSummary(sessionEvents);
     score = computeSmartScore(sessionEvents, friction);
     toolCount = countToolUseEvents(sessionEvents);
@@ -570,6 +627,10 @@ export async function contributeCheckForSession(
   // almost no work (e.g. a single rejected command). Requires real activity.
   const willHint = score >= CONTRIBUTE_SMART_THRESHOLD && toolCount >= CONTRIBUTE_BASE_THRESHOLD;
 
+  // Build the hint text once; it is either returned (Stop stdout) or stashed for
+  // UserPromptSubmit delivery, never both.
+  const hintText = willHint ? buildHint({ friction, promptSummary, isKnowledgeGap }) : null;
+
   // Single write: re-read first to avoid clobbering parallel /contribute marks.
   // Skip the write on cache hit + low score (state is already current).
   if (needsPersist || willHint) {
@@ -589,6 +650,11 @@ export async function contributeCheckForSession(
     if (latest.hinted || willHint) {
       updated.hinted = true;
     }
+    // For tools whose Stop hook ignores stdout, stash the hint in this same
+    // write for delivery on the next UserPromptSubmit — no second write.
+    if (willHint && stashInsteadOfReturn) {
+      updated.pendingHint = hintText ?? undefined;
+    }
     await writeContributeState(sessionId, updated);
   }
 
@@ -597,7 +663,25 @@ export async function contributeCheckForSession(
     return { hint: null };
   }
 
-  return { hint: buildHint({ friction, promptSummary, isKnowledgeGap }) };
+  // stashInsteadOfReturn callers receive null here (the hint was persisted as
+  // pendingHint above); everyone else gets the hint to write to Stop stdout.
+  return { hint: stashInsteadOfReturn ? null : hintText };
+}
+
+/**
+ * Read and clear a pending share-learnings hint for this session, if any.
+ * Returns the hint text (to inject via UserPromptSubmit additionalContext) or
+ * null. Clearing preserves all other state (including `hinted`), so the
+ * one-hint-per-session guarantee holds. If the user already contributed between
+ * the stash and now, the stale nudge is cleared and dropped (returns null).
+ */
+export async function takePendingHint(sessionId: string): Promise<string | null> {
+  const state = await readContributeState(sessionId);
+  if (!state.pendingHint) return null;
+  const hint = state.pendingHint;
+  // Clear regardless; if the user already contributed, drop the stale nudge.
+  await writeContributeState(sessionId, { ...state, pendingHint: undefined });
+  return state.contributed ? null : hint;
 }
 
 /**
@@ -623,10 +707,61 @@ export async function contributeCheck(toolArg?: string): Promise<void> {
     return;
   }
 
-  const { hint } = await contributeCheckForSession(stdinData.sessionId, stdinData.cwd);
+  // This standalone CLI path always writes the hint to Stop stdout (no stashing).
+  // It is NOT wired for codebuddy/workbuddy — those route through hook-dispatch's
+  // contributeCheckHandler, which stashes instead. If a future tool whose Stop
+  // hook ignores stdout is ever pointed at this command directly, the hint would
+  // be silently dropped; such a tool must go through the stashing handler.
+  const { hint } = await contributeCheckForSession(
+    stdinData.sessionId,
+    stdinData.cwd,
+    stdinData.transcriptPath,
+  );
   if (hint !== null) {
     const { formatStopHookOutput } = await import('./utils/hook-output.js');
     process.stdout.write(formatStopHookOutput(hint, toolArg ?? 'claude'));
+  }
+}
+
+/**
+ * Stash a votes-nudge hint for delivery on the next UserPromptSubmit.
+ * Used for tools (codebuddy/workbuddy) whose Stop hook ignores stdout.
+ */
+export async function stashVotesHint(sessionId: string, hintText: string): Promise<void> {
+  try {
+    await writeJsonAtomic(getPendingVotesHintPath(sessionId), { hintText });
+  } catch (e) {
+    log.error(`Failed to write pending votes hint: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * Read and clear a pending votes-nudge hint for this session, if any.
+ * Returns the hint text or null. The independent sidecar is atomically written
+ * so a concurrent prompt-submit never observes a truncated hint.
+ */
+export async function takePendingVotesHint(sessionId: string): Promise<string | null> {
+  const sidecarPath = getPendingVotesHintPath(sessionId);
+  const pending = await readJson<{ hintText?: unknown }>(sidecarPath);
+  if (!pending || typeof pending.hintText !== 'string' || !pending.hintText) return null;
+  await fs.promises.unlink(sidecarPath).catch(() => undefined);
+  return pending.hintText;
+}
+
+/** Atomically cap Cursor's Stop follow-up nudge to once per session. */
+export async function claimVotesNudge(sessionId: string): Promise<boolean> {
+  const markerPath = getVotesNudgeMarkerPath(sessionId);
+  try {
+    await ensureDir(path.dirname(markerPath));
+    await fs.promises.writeFile(markerPath, '{}\n', { encoding: 'utf-8', flag: 'wx' });
+    // The claim is complete once the exclusive marker write succeeds. Cleanup
+    // is best-effort and must not swallow Cursor's one allowed nudge.
+    await cleanupStaleSessions(path.dirname(markerPath), sessionId).catch(() => undefined);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    log.error(`Failed to claim votes nudge: ${(e as Error).message}`);
+    return false;
   }
 }
 

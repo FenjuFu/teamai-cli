@@ -1,11 +1,11 @@
 import path from 'node:path';
 import { autoDetectInit } from './config.js';
-import { reconcileHooksToAllTools, getHookStatus, type HookStatus } from './hooks.js';
+import { reconcileHooksToAllTools, sweepLegacyProjectHooks, getHookStatus, hasInstalledCodexTrustGatedTool, codexTrustReminder, type HookStatus } from './hooks.js';
 import { builtinHookDefs } from './builtin-hooks.js';
 import { parseTeamHooks, resolveTeamHooks } from './resources/hooks.js';
 import { log } from './utils/logger.js';
-import type { GlobalOptions, LocalConfig } from './types.js';
-import { resolveBaseDir, getManagedHooksPath } from './types.js';
+import type { GlobalOptions } from './types.js';
+import { resolveHookScope, isSelfMode } from './types.js';
 import { getUserHome } from './utils/home.js';
 
 type HookListStatus = HookStatus | 'not configured';
@@ -14,34 +14,6 @@ interface HookListRow {
     tool: string;
     status: HookListStatus;
     settingsPath: string;
-}
-
-interface HookScopeTarget {
-    baseDir: string;
-    manifestPath: string;
-}
-
-/**
- * Resolve the (baseDir, manifestPath) pair for hook reconciliation.
- *
- * User scope → HOME + user manifest (unchanged).
- * Project scope → HOME + user manifest only (#264). The previous behaviour
- * duplicated entries into <projectRoot> as well (for #44 subdirectory
- * coverage), but HOME already covers every cwd. The dispatch runtime now
- * identifies the active project via detectProjectConfig(stdin.cwd), so a
- * redundant projectRoot copy is unnecessary.
- */
-function resolveHookScopeTargets(localConfig: LocalConfig): HookScopeTarget[] {
-    if (localConfig.scope !== 'project') {
-        return [{
-            baseDir: resolveBaseDir(localConfig) ?? '',
-            manifestPath: getManagedHooksPath(localConfig.scope, localConfig.projectRoot),
-        }];
-    }
-    return [{
-        baseDir: getUserHome(),
-        manifestPath: getManagedHooksPath('user'),
-    }];
 }
 
 function formatDisplayPath(settingsPath: string): string {
@@ -84,12 +56,31 @@ export async function hooksInject(options: GlobalOptions): Promise<void> {
         auto: false,
         silent: options.silent,
     });
-    for (const { baseDir, manifestPath } of resolveHookScopeTargets(localConfig)) {
-        await reconcileHooksToAllTools(teamConfig.toolPaths, baseDir, teamDefs, manifestPath, { builtinOverride: builtin });
+    let codexTrustGated = false;
+    const { baseDir, manifestPath } = resolveHookScope(localConfig);
+    await reconcileHooksToAllTools(teamConfig.toolPaths, baseDir, teamDefs, manifestPath, {
+        builtinOverride: builtin,
+        teamHookProjectRoot: localConfig.scope === 'project' && !isSelfMode(localConfig)
+            ? localConfig.projectRoot
+            : undefined,
+        installedBaseDir: localConfig.scope === 'project' ? (localConfig.projectRoot ?? baseDir) : undefined,
+    });
+    if (await hasInstalledCodexTrustGatedTool(teamConfig.toolPaths, baseDir)) {
+        codexTrustGated = true;
     }
+
+    // Sweep any legacy <projectRoot> copy a pre-#370 CLI left behind, so the
+    // HOME copy this command just wrote is the only one that fires (#264/#370).
+    await sweepLegacyProjectHooks(teamConfig.toolPaths, localConfig);
 
     if (!options.silent) {
         log.success('Hooks injected into all AI tool settings');
+        // The public Codex gates non-managed hooks behind an explicit trust step;
+        // remind the user to trust them in Codex. teamai never edits [hooks.state]
+        // to auto-trust (constraint: reminder only, no bypass).
+        if (codexTrustGated) {
+            log.warn(codexTrustReminder());
+        }
     }
 }
 
@@ -100,7 +91,7 @@ export async function hooksInject(options: GlobalOptions): Promise<void> {
  */
 export async function hooksList(_options: GlobalOptions): Promise<void> {
     const { localConfig, teamConfig } = await autoDetectInit();
-    const baseDirs = resolveHookScopeTargets(localConfig).map((t) => t.baseDir);
+    const { baseDir } = resolveHookScope(localConfig);
     const rows: HookListRow[] = [];
 
     for (const [tool, paths] of Object.entries(teamConfig.toolPaths)) {
@@ -108,14 +99,12 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
             rows.push({ tool, status: 'not configured', settingsPath: 'no settings configured' });
             continue;
         }
-        for (const baseDir of baseDirs) {
-            const settingsPath = path.join(baseDir, paths.settings);
-            rows.push({
-                tool,
-                status: await getHookStatus(settingsPath, tool),
-                settingsPath: formatDisplayPath(settingsPath),
-            });
-        }
+        const settingsPath = path.join(baseDir, paths.settings);
+        rows.push({
+            tool,
+            status: await getHookStatus(settingsPath, tool),
+            settingsPath: formatDisplayPath(settingsPath),
+        });
     }
 
     console.log(formatHooksList(rows));
@@ -150,16 +139,15 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
 export async function hooksRemove(_options: GlobalOptions): Promise<void> {
     const { localConfig, teamConfig } = await autoDetectInit();
 
-    for (const { baseDir, manifestPath } of resolveHookScopeTargets(localConfig)) {
-        await reconcileHooksToAllTools(teamConfig.toolPaths, baseDir, [], manifestPath, { removeAll: true });
-    }
+    const { baseDir, manifestPath } = resolveHookScope(localConfig);
+    await reconcileHooksToAllTools(teamConfig.toolPaths, baseDir, [], manifestPath, { removeAll: true });
 
-    // Clean up legacy projectRoot entries left by older versions that wrote
-    // hooks into both <projectRoot> and HOME (#264 migration).
-    if (localConfig.scope === 'project' && localConfig.projectRoot) {
-        const legacyManifest = getManagedHooksPath('project', localConfig.projectRoot);
-        await reconcileHooksToAllTools(teamConfig.toolPaths, localConfig.projectRoot, [], legacyManifest, { removeAll: true });
-    }
+    // Clean up the legacy <projectRoot> copy a pre-#370 CLI wrote alongside HOME
+    // for a non-self project scope. Gated to a project-owned location that
+    // differs from the primary target — never HOME (shared with user scope, and
+    // the primary target itself when projectRoot IS the home dir), and never
+    // re-running on the primary target in self mode.
+    await sweepLegacyProjectHooks(teamConfig.toolPaths, localConfig);
 
     log.success('Hooks removed from all AI tool settings');
 }

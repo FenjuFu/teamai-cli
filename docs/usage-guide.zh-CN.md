@@ -74,7 +74,7 @@ teamai --version
 
 > 只需一位管理员完成，其他成员跳到[成员接入](#成员接入)。
 
-在 GitHub、GitLab（gitlab.com 或自建实例）、CNB（cnb.cool）、TGit（腾讯工蜂），或任意私有/自建 Git 服务上创建一个空仓库（命名建议：`TeamAi-<团队名>`），或者直接执行 `teamai init`，不存在时会提示自动创建。
+在 GitHub、GitLab（gitlab.com 或自建实例）、GitCode（gitcode.com）、CNB（cnb.cool）、TGit（腾讯工蜂），或任意私有/自建 Git 服务上创建一个空仓库（命名建议：`TeamAi-<团队名>`），或者直接执行 `teamai init`，不存在时会提示自动创建。
 
 ### 项目级（Project Scope，默认）
 
@@ -298,7 +298,7 @@ teamai pull              # 手动拉取
 teamai pull --dry-run    # 试运行，不实际修改
 ```
 
-> Project scope 默认与 user scope 隔离。当前工作目录包含 project scope 的 `.teamai/config.yaml` 时，`pull` 会处理该项目并跳过 user scope；仅当本地配置包含 `inheritUserScope: true` 时，才会先刷新安全的 user 资源通道。当前目录没有 project 配置时，`pull` 处理 user scope。project 模式下，user 的 `env`、hooks、MCP 定义、sources、reporting 和写入行为仍保持隔离。
+> Project scope 默认与 user scope 隔离。当前工作目录包含 project scope 的 `.teamai/config.yaml` 时，`pull` 会处理该项目并跳过 user scope；仅当本地配置包含 `inheritUserScope: true` 时，才会先刷新安全的 user 资源通道。当前目录没有 project 配置时，`pull` 处理 user scope。project 模式下，user 的 `env`、MCP 定义、sources、reporting 和写入行为仍保持隔离。hooks 是唯一例外：project scope 的 hooks 会注入到你的 **HOME** 工具设置（`~/.claude/settings.json` 等），而非 `<projectRoot>`——因为内置 hooks 依据传给 `hook-dispatch` 的 `cwd` 门控，且 `~/.claude` 恒存在、能通过「已安装工具」门槛（详见 Hooks 章节）。self 单仓模式则把 hooks 保留在业务仓库里，随 clone 传播。
 
 启用角色化 skills 后，`pull` 的 skills 同步来源会变成 `skills/<namespace>/` 中的内容，按 `primaryRole + additionalRoles` 展开对应的 namespace，拍平安装到本地各 AI 工具 skills 目录。`rules/`、`docs/`、`learnings/` 仍然保持原有全局同步逻辑。
 
@@ -347,7 +347,9 @@ Choose namespace [1-3] (default: 1 = common):
 - 单一命名空间时自动选中；`--silent` 模式使用默认值
 - 修改已有 skill 时自动保持原 namespace
 
-**YAML Frontmatter 自动补全：** 推送时 CLI 自动检查 `SKILL.md`，缺少 `name`/`description` 则自动补全，无需手动维护。
+**更新已存在的 PR 而非重复创建：** 如果某个资源已在一个未合并的 PR 中等待评审，再次对它执行 `teamai push` 会就地更新那个已存在的 PR（通过 force-push 其分支），而不是新开一个重复的 PR。保持该资源被选中即更新其 PR；取消勾选则不动它。同一次运行中选中的其他无关资源会进入各自新开的 PR。一旦该 PR 合并（或其分支从远端删除），记录会被清除，下次 push 照常新开 PR。
+
+**YAML Frontmatter 自动补全：** 推送时 CLI 自动检查合法的 mapping 形式 `SKILL.md` frontmatter，缺少 `name`/`description` 则自动补全。格式损坏或根节点为标量时会保留原文并告警，需要手动修复。
 
 ### 查看状态
 
@@ -431,6 +433,8 @@ teamai push --role pm
 > tags: [deploy, automation]
 > ---
 > ```
+>
+> YAML 格式损坏或 frontmatter 根节点不是 mapping 时，CLI 会保留原文并输出告警；请手动修复后再推送。
 
 启用角色化 skills 后，push 的目标目录为：
 
@@ -573,6 +577,137 @@ teamai recall status     # 查看当前生效状态（团队默认 + 用户覆�
 ```
 
 关闭后，`teamai pull` 将跳过部署 recall subagent、recall rules 注入块和 TodoWrite 提醒 hook。手动执行 `teamai recall <query>` 搜索不受此开关影响。
+
+### 知识库维护
+
+随着时间推移，部分 learnings 会积累低置信度（无人 upvote）或变得过时。`teamai recall maintenance` 可保持知识库健康：
+
+| 选项 | 说明 |
+|------|------|
+| `--prune` | 查找低于置信度阈值的 learnings 并删除 |
+| `--threshold <n>` | 剪枝用置信度阈值（默认 `0.15`） |
+| `--archive` | 将剪枝条目移至 `archive/` 而非直接删除 |
+| `--confidence-writeback` | 从投票历史重新计算置信度，并回写到 frontmatter |
+| `--update-quality` | 找出高召回但低认可的 docs/rules/skills，生成 AI 更新草稿（`.draft.md` 文件） |
+| `--dry-run` | 预览将要执行的操作，不做任何实际修改 |
+
+```bash
+# 预览过时条目，不做任何修改
+teamai recall maintenance --prune --dry-run
+
+# 归档低置信度 learnings（置信度 < 0.15）
+teamai recall maintenance --prune --archive
+
+# 按当前投票重新计算并回写置信度分数
+teamai recall maintenance --confidence-writeback
+
+# 查找过时条目并生成更新草稿
+teamai recall maintenance --update-quality
+```
+
+运行 `--update-quality` 后，审查生成的 `.draft.md` 文件，将满意的文件重命名为 `.md` 即可应用更新。
+
+### 晋升 Learnings
+
+当 learning 达到成熟标准时，可将其晋升为正式团队知识（skill、rule 或 doc）。晋升判据：置信度 ≥ 0.90、≥ 5 次 upvote、≥ 2 个不同贡献者、存在时长 ≥ 14 天。
+
+```bash
+# 列出所有可晋升候选
+teamai recall promote
+
+# 晋升指定 learning（AI 将其改写为目标格式）
+teamai recall promote <learningId>
+
+# 晋升到指定类别
+teamai recall promote <learningId> --category skills
+
+# 预览操作，不写入文件
+teamai recall promote <learningId> --dry-run
+```
+
+选项：
+
+| 选项 | 说明 |
+|------|------|
+| `--category <cat>` | 目标类别：`skills` \| `rules` \| `docs` |
+| `--dry-run` | 预览操作，不做任何实际修改 |
+
+---
+
+## 知识库健康报告
+
+看板内置了一个 **KB Health**（知识库健康）报告页面，展示团队知识库的使用情况与健康状态，涵盖 `teamai recall` 投票、learnings、docs、rules 和 skills 采集到的所有数据。
+
+```bash
+# 启动看板后，点击顶部的 "KB Health" 链接
+teamai dashboard
+
+# 报告也可直接访问：
+#   http://localhost:3721/kb-report
+```
+
+报告会聚合本地 `~/.teamai` 知识库（或已配置的团队仓库），打开页面即按需渲染，无需任何参数。
+
+### 报告内容
+
+| 区块 | 说明 |
+|------|------|
+| **概览卡片** | 总条目数、总召回次数、整体覆盖率%、贡献者数 |
+| **各类型覆盖率** | skills、rules、docs、learnings 的召回覆盖率分类 |
+| **高频召回排行** | 召回次数最多的条目排名列表 |
+| **沉默条目** | 从未被召回的条目——待剪枝或重写的候选 |
+| **召回趋势** | 召回活跃度随时间的变化 |
+| **作者贡献** | 每位贡献者的条目数与召回占比 |
+| **维护控制台** | 三个操作区：待晋升条目、建议归档条目、过时待更新条目，每条附可复制命令 |
+
+### 典型工作流
+
+```
+打开看板 → KB Health 页面
+   ↓
+查看维护控制台
+   ↓
+晋升成熟 learnings：
+   teamai recall promote <learningId>
+   ↓
+归档低价值条目：
+   teamai recall maintenance --prune --archive
+   ↓
+更新过时的 docs/rules/skills：
+   teamai recall maintenance --update-quality
+   （审查 .draft.md → 重命名为 .md）
+   ↓
+teamai push   # 将清理后的知识库分享给团队
+```
+
+---
+
+## 提交 Co-Author 署名（Commit Co-Author Attribution）
+
+AI 编码工具会在它生成的提交上打一个 `Co-Authored-By:` / attribution 尾注。希望保持干净历史的团队可以为全员关闭它，成员仍可在自己机器上覆盖。`teamai pull` 会把最终生效的意图写入每个已安装工具各自的配置文件。
+
+该功能采用与 recall 相同的两级配置：
+
+| 层级 | 配置文件 | 字段 | 说明 |
+|------|----------|------|------|
+| 团队默认 | `teamai.yaml` | `sharing.coAuthor.enabled` | `true` = 保留尾注 / `false` = 去除尾注。整块省略表示"无意见"（teamai 不做任何改动） |
+| 用户覆盖 | `~/.teamai/config.yaml` | `coAuthorEnabled` | `true` / `false`，优先级高于团队默认 |
+
+不同工具家族映射到不同的设置项：
+
+| 工具家族 | 文件 | 写入的设置 | 作用域 | 可靠性 |
+|------|------|------|------|------|
+| Claude（`claude`、`codebuddy`、`workbuddy`） | `settings.json` | `attribution.commit` / `attribution.pr` 置为 `""` | 用户 **或** 项目（跟随当前 scope） | 确定生效 |
+| Codex（`codex`） | `~/.codex/config.toml` | `commit_attribution = ""` | 仅用户 | 尽力而为 —— 仅当 `[features].codex_git_commit = true` 时生效，teamai 不会强制开启该开关 |
+| Cursor | `~/.cursor/cli-config.json` | `attribution.attributeCommitsToAgent = false` | 仅用户 | 尽力而为 —— 存在[上游已知 bug](https://forum.cursor.com/t/local-executor-ignores-cli-config-attribution-opt-out-forcing-co-authored-by-trailer/167722)，local executor 可能忽略该设置 |
+
+语义：
+
+- **只写不删。** teamai 一旦写入某个值，之后团队撤下策略也不会改动该值 —— teamai 绝不还原它去除过的尾注。若要重新启用，请显式把意图设回 `true`（这会移除 teamai 的覆盖，从而恢复工具自身的默认行为）。
+- **幂等。** teamai 在 `state.json` 的 `coAuthorManaged` 中记录每个文件上次写入的值，无变化时跳过写入。
+- **只改动已安装的工具**，并保留各配置文件中已有的键与注释（键级别的精修，而非整文件重生成）。
+
+`pull` 之后请重启 AI 工具会话使改动生效。
 
 ---
 
@@ -770,6 +905,7 @@ agent hook 规则：
 | `TEAMAI_SKILL_DOWNLOAD_HOSTS` | skill `download_url` host 白名单（空 = 全部放行） |
 | `TEAMAI_ALLOW_SANDBOX_REPORT` | 设为 `1` 可强制在 CloudStudio 沙箱内 report/sync（见下方说明） |
 | `TEAMAI_DISABLE_REMOTE_CMD` | 设为 `1` 可拒绝服务端下发的 `uninstall_teamai`、`install_hook_rule`、`uninstall_hook_rule` 命令（会 ack `failed`） |
+| `TEAMAI_SKIP_AST` | 设为 `1` 时强制仅用启发式提取，跳过 WASM tree-sitter AST 轨 |
 
 > **隐私**：install path 和 machine id 仅在本地哈希以派生 `local_agent_id`，不会上报。
 
@@ -809,6 +945,8 @@ teamai import --from-repo https://github.com/org/repo --skip-enrich
 ```
 
 图谱存储组件、接口、配置和跨仓库依赖关系。`teamai recall` 利用图谱进行 BM25 + graph-boost 增强排名。
+
+依赖边由两条并行轨道提取：WASM tree-sitter **AST 轨**（TypeScript/JavaScript、Python、Go），将 import、调用、以及 TS `implements` 子句解析为精确的文件到文件边（`code-ast`）；以及正则 **启发式轨**（所有语言，`code-heuristic`），同时覆盖 AST 轨未支持的语言。重叠时 AST 结果优先。AST 解析器无需原生编译工具链；加载失败时提取会降级到启发式并记录一条 `AST_UNAVAILABLE` gap。设置 `TEAMAI_SKIP_AST=1` 可强制仅用启发式提取。
 
 ```bash
 # 图谱健康检查
@@ -887,6 +1025,8 @@ teamai hooks remove    # 移除
 
 这两个命令只会操作你实际已安装的工具（即 `~/.<tool>/` 根目录已存在的工具）。对于 `toolPaths` 中已配置但未安装的工具，命令不会为其凭空创建根目录。
 
+> **Codex 信任门槛** — Codex（OpenAI / ChatGPT Codex 应用，工具 id 为 `codex`）对非托管 hooks 设有显式的用户信任机制。teamai 写入 `~/.codex/hooks.json` 后，对于新增或变更的 hook，Codex 可能会跳过执行，直到你在 `/hooks` 或 Settings → Hooks 中 review/trust。当检测到 Codex hooks 已安装时，`teamai hooks inject` 与 `teamai doctor` 会输出提示；teamai 从不修改 Codex 的 `[hooks.state]` 来自动信任 —— 信任操作交由你手动完成。（内部变体 `codex-internal` / `tcodex` 共用 hooks.json 格式但没有信任门槛，因此不会为它们输出提示。）
+
 ### 团队 Hooks 声明
 
 团队可在仓库 `hooks/hooks.yaml` 中声明自定义 hooks，`teamai pull` 自动分发到所有成员的 AI 工具：
@@ -944,6 +1084,22 @@ team-repo/
 - **Rules** 会被复制到 `.opencode/rules/`（或 `~/.config/opencode/rules/`），但 OpenCode 不会自动扫描 rules 目录——文件在被引用前是惰性的。因此 teamai 会往 `opencode.json` 的 `instructions` 数组里加一条 `rules/*.md` glob，并在团队最后一条 rule 消失时再把它移除，且只编辑这一个键、不动你自己的 `instructions` 条目。
 - **Hooks** 以 OpenCode *plugin* 形式交付，而非配置文件条目——OpenCode 没有 `hooks` 数组，它会**同时**加载 `~/.config/opencode/plugin/` 和 `<project>/.opencode/plugin/` 下的 JS/TS 插件。两个目录都有插件时会被加载两次，每个事件也就派发两次，因此 teamai 只保留一份：写在用户目录的 `teamai-hooks.ts`，覆盖所有项目；早期布局残留的项目级副本会在下次同步时被删除。这与其他工具一致——它们的 `settings.json` hooks 同样放在 HOME，靠传给 `hook-dispatch` 的 `cwd` 做作用域判断。插件订阅 OpenCode 自己的事件，并 shell 到其他所有工具共用的 `teamai hook-dispatch` 入口。事件映射对齐 Claude 内置集合：`session.created` → session-start、`session.idle` → stop、`chat.message` → prompt-submit、`tool.execute.after` → post-tool-use。插件会转发与其他工具一致的 STDIN 负载（`cwd`、`tool_name`、`tool_input`、`prompt`），并把 OpenCode 的小写工具 id（`skill`、`todowrite`）映射回 handler 注册表期望的 PascalCase matcher。OpenCode 无法把 hook 的 stdout 回注到会话，因此 hooks 只为副作用运行（状态上报 / 同步 / 更新）。注意 OpenCode 会 **await** 它的具名 hook（`chat.message`、`tool.execute.after`），所以这两个事件的派发会短暂等待 `teamai` 子进程后 agent 才继续；错误始终被吞掉，hook 永远不会让会话失败。服务端下发的 agent hook（`teamai-agent-<slug>.ts`）同样装在这个用户级 plugin 目录下。
 - **MCP** server 位于共享 `opencode.json` 的 `mcp` 键下（详见上文 MCP 章节）。
+
+### Cursor
+
+Cursor 的项目规则必须以 **`.mdc`** 文件形式放在 `.cursor/rules/` 下，且带 YAML frontmatter——放在那里的纯 `.md` 会被 Cursor 直接忽略。因此 teamai 向 Cursor 写规则时用 `<name>.mdc`（其他工具仍写纯 `.md`），并从团队规则派生 frontmatter：
+
+- 带 `paths:` 列表的规则会转成 `globs: "<逗号拼接>"` + `alwaysApply: false`（上下文中有匹配文件时 Cursor 自动附加该规则）。值加引号是因为以 `*` 开头的 glob 不加引号时并非合法 YAML。
+- 无 `paths` 的规则（团队强制规则）会转成 `alwaysApply: true`（每个 Cursor 会话都应用）。
+
+两种格式之间只有 markdown 正文互通，各自的 frontmatter 归各自所有。`pull` 时 Cursor 的 frontmatter 由机器派生（正文原样拷贝，仅规范化首尾空行），因此 `pull` → `push` 往返不会被误判为内容变更。`push` 时，在 `.cursor/rules/*.mdc` 里改完正文再执行 `teamai push`，**只有正文**会回流上游——团队规则自己的 `paths:` frontmatter 会被保留，规则的作用域不会被悄悄丢掉。
+
+有两类文件刻意**不会**从 Cursor 规则目录推送：
+
+- 团队仓库中没有同名规则的 `.mdc`。`.cursor/rules/` 同时也是 Cursor 自带的 *New Cursor Rule* 命令写入个人规则的地方，teamai 不会把它们当作新的团队资源。
+- CLI 内置规则——它们是被下发的（对 Cursor 同样写成 `.mdc`），而非同步而来。
+
+从旧版本升级：旧布局写入的 `.cursor/rules/*.md` 是无效文件（Cursor 从未读取过它们），因此 `pull`、`remove`、`uninstall` 会连同 `.mdc` 一起删除。你自己放在那里的 `.md` 不受影响。
 
 ### 其他
 
@@ -1048,6 +1204,8 @@ sharing:
     localDir: ./.teamai/docs
   env:
     injectShellProfile: true
+  coAuthor:
+    enabled: false             # 可选，为全团队去除 AI 工具提交尾注
 ```
 
 ### config.yaml（本地配置）
@@ -1061,6 +1219,7 @@ updatePolicy: auto
 scope: project                 # project（init 默认）或 user
 projectRoot: /path/to/project  # 仅 project scope
 inheritUserScope: true         # 可选，仅 project scope，默认 false
+coAuthorEnabled: true          # 可选，每机器的 co-author 覆盖
 ```
 
 ---
@@ -1113,7 +1272,7 @@ teamai pull
 
 **Q: User scope 和 Project scope 可以共存吗？**
 
-可以，但 project scope 默认保持隔离。当前工作目录包含 project scope 配置时，该项目生效并跳过 user scope。先初始化 user scope，再使用 `--inherit-user-scope` 初始化项目（或在项目本地配置中设置 `inheritUserScope: true`），即可组合安全资源和 Recall 结果；可执行配置和控制面配置仍只使用 project scope。
+可以，但 project scope 默认保持隔离。当前工作目录包含 project scope 配置时，该项目生效并跳过 user scope。先初始化 user scope，再使用 `--inherit-user-scope` 初始化项目（或在项目本地配置中设置 `inheritUserScope: true`），即可组合安全资源和 Recall 结果；可执行配置和控制面配置（`env`、MCP）仍只使用 project scope；hooks 例外——非-self 的 project scope 会把 hooks 注入到 HOME，以便 `hook-dispatch` 依据 `cwd` 门控（详见 Hooks 章节）。
 
 **Q: `teamai init` 提示已初始化？**
 

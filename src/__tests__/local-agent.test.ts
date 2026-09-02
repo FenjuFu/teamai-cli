@@ -174,6 +174,32 @@ describe('local-agent: bindCurrentProject --skip', () => {
     expect(binding.projectName).toBe('__skipped__');
     expect(binding.boundAt).toBeTruthy();
   });
+
+  it('skips the whole project (main + all worktrees) when run from a worktree', async () => {
+    await setupConfig();
+    const mainDir = path.join(tmpDir, 'main-repo');
+    const worktreeDir = path.join(tmpDir, 'linked-wt');
+    await fse.ensureDir(mainDir);
+    const { execFileSync } = await import('node:child_process');
+    const git = (args: string[], cwd: string) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+    git(['init'], mainDir);
+    git(['config', 'user.email', 'test@example.com'], mainDir);
+    git(['config', 'user.name', 'test'], mainDir);
+    git(['commit', '--allow-empty', '-m', 'init'], mainDir);
+    git(['worktree', 'add', worktreeDir], mainDir);
+
+    const { bindCurrentProject } = await import('../local-agent.js');
+    // Skip from *inside the worktree*.
+    await bindCurrentProject({ skip: true, cwd: worktreeDir });
+
+    const config = await fse.readJson(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'));
+    const realMain = fse.realpathSync(mainDir);
+    const realWt = fse.realpathSync(worktreeDir);
+    // The skip decision is recorded on BOTH the main checkout (the shared
+    // projectAnchor — so sibling worktrees inherit it) and this worktree.
+    expect(config.workspaceBindings[realMain]?.projectName).toBe('__skipped__');
+    expect(config.workspaceBindings[realWt]?.projectName).toBe('__skipped__');
+  });
 });
 
 describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
@@ -427,6 +453,125 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
     } finally {
       process.stdout.write = origWrite;
     }
+  });
+
+  it('session_start with unbound workspace emits stdout hint instead of blocking on TTY prompt', async () => {
+    process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
+    await setupConfig();
+    const projectDir = path.join(tmpDir, 'session-start-project');
+    await fse.ensureDir(projectDir);
+    const { execFileSync } = await import('node:child_process');
+    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+
+    // Guarantee non-TTY so askViaTty returns null immediately (no /dev/tty open).
+    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/api/projects/mine')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          projects: [
+            { id: 100, name: 'alpha' },
+            { id: 200, name: 'beta' },
+          ],
+        }));
+      }
+      return new Response(JSON.stringify({ ok: true }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const stdoutChunks: string[] = [];
+    const origWrite = process.stdout.write;
+    process.stdout.write = ((chunk: string | Buffer) => {
+      stdoutChunks.push(typeof chunk === 'string' ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+
+    try {
+      const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+      // Assertion 1: call resolves without hanging (no /dev/tty readline block).
+      const promise = reportAndSyncLocalAgent({
+        cwd: projectDir,
+        tool: 'claude',
+        event: {
+          type: 'session_start',
+          timestamp: new Date().toISOString(),
+          sessionId: TEST_SESSION_ID,
+          tool: 'claude',
+        },
+      });
+      await expect(promise).resolves.not.toThrow();
+    } finally {
+      process.stdout.write = origWrite;
+    }
+
+    const output = stdoutChunks.join('');
+    // Assertion 2: stdout contains hookSpecificOutput (the ensureWorkspaceBinding fallback path).
+    expect(output).toContain('hookSpecificOutput');
+
+    // Assertion 3: additionalContext carries the unbound-workspace hint keywords.
+    const parsed = JSON.parse(output.trim().split('\n').find((l) => l.includes('hookSpecificOutput'))!);
+    const ctx = parsed.hookSpecificOutput.additionalContext as string;
+    expect(ctx).toContain('当前工作区尚未绑定项目');
+    expect(ctx).toContain('teamai bind-project');
+  });
+});
+
+describe('local-agent: worktree binding inheritance', () => {
+  it('inherits the main checkout binding without re-prompting in a worktree', async () => {
+    process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
+    const mainDir = path.join(tmpDir, 'main-repo');
+    const worktreeDir = path.join(tmpDir, 'linked-wt');
+    await fse.ensureDir(mainDir);
+    const { execFileSync } = await import('node:child_process');
+    const git = (args: string[], cwd: string) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+    git(['init'], mainDir);
+    git(['config', 'user.email', 'test@example.com'], mainDir);
+    git(['config', 'user.name', 'test'], mainDir);
+    git(['commit', '--allow-empty', '-m', 'init'], mainDir);
+    git(['worktree', 'add', worktreeDir], mainDir);
+
+    const realMain = fse.realpathSync(mainDir);
+    const realWt = fse.realpathSync(worktreeDir);
+    // Only the MAIN checkout is bound.
+    await setupConfig({
+      [realMain]: { projectId: 42, projectName: 'gamma', boundAt: '2026-01-01T00:00:00.000Z' },
+    });
+
+    // Projects are available — so a real prompt WOULD fire if inheritance failed.
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/api/projects/mine')) {
+        return new Response(JSON.stringify({ ok: true, projects: [{ id: 42, name: 'gamma' }] }));
+      }
+      return new Response(JSON.stringify({ ok: true }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const stdoutChunks: string[] = [];
+    const origWrite = process.stdout.write;
+    process.stdout.write = ((chunk: string | Buffer) => {
+      stdoutChunks.push(typeof chunk === 'string' ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+
+    try {
+      const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+      await reportAndSyncLocalAgent({
+        cwd: worktreeDir,
+        tool: 'claude',
+        event: { type: 'prompt_submit', timestamp: new Date().toISOString(), sessionId: 'test-session', tool: 'claude' },
+      });
+    } finally {
+      process.stdout.write = origWrite;
+    }
+
+    // No binding prompt/hint in the worktree.
+    expect(stdoutChunks.join('')).not.toContain('hookSpecificOutput');
+    // The worktree inherited the main checkout's project_id (so its resources
+    // are reported/delivered), while resources still land in the worktree itself.
+    const config = await fse.readJson(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'));
+    expect(config.workspaceBindings[realWt]?.projectId).toBe(42);
+    expect(config.workspaceBindings[realWt]?.projectName).toBe('gamma');
   });
 });
 

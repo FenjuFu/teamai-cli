@@ -147,9 +147,10 @@ export function remotesMatch(a: string, b: string): boolean {
 export async function hasCommits(localPath: string): Promise<boolean> {
   const git = createGit(localPath);
   try {
-    // NB: `--quiet` makes git exit 1 silently on an unborn HEAD, and simple-git
-    // does not throw on that — so we must validate the OUTPUT (a real sha), not
-    // rely on a thrown error. An unborn HEAD yields empty/whitespace output.
+    // On an unborn HEAD `rev-parse --verify HEAD^{commit}` exits non-zero and
+    // simple-git throws, so the catch below is the primary guard. The sha-shape
+    // check is a belt-and-suspenders guard for the rare case a build resolves
+    // HEAD to empty/whitespace output without throwing.
     const out = (await git.raw(['rev-parse', '--verify', 'HEAD^{commit}'])).trim();
     return /^[0-9a-f]{7,40}$/.test(out);
   } catch {
@@ -194,13 +195,65 @@ export async function commitPaths(
   return true;
 }
 
+/**
+ * Pull the latest changes from origin into a local team-repo clone.
+ *
+ * Non-destructive by default:
+ *   Layer 1: fast-forward-only pull (--ff-only). Succeeds when the local branch
+ *     is behind or already up to date with origin, without touching unrelated
+ *     uncommitted files.
+ *   Layer 2: if ff-only fails (diverged / ahead / no tracking) AND the repo is a
+ *     dedicated clone root, realign to origin/<branch> via fetch + hard reset.
+ *     On a non-dedicated path (e.g. a business-repo subdir in single-repo mode)
+ *     a hard reset would wipe the user's working tree, so we re-throw the
+ *     original error instead of resetting.
+ * Before any hard reset we log.warn if it would discard local commits or
+ * uncommitted changes, so the loss is never silent. A failed fetch is re-thrown
+ * so the caller surfaces the real network/auth cause.
+ */
 export async function pullRepo(localPath: string): Promise<string> {
   const git = createGit(localPath);
-  const result = await git.pull();
-  if (result.summary.changes === 0 && result.summary.insertions === 0 && result.summary.deletions === 0) {
-    return 'already up to date';
+  const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+
+  try {
+    const result = await git.pull(['--ff-only']);
+    if (result.summary.changes === 0 && result.summary.insertions === 0 && result.summary.deletions === 0) {
+      return 'already up to date';
+    }
+    return `${result.summary.changes} file(s) changed`;
+  } catch (err) {
+    // ff-only failed. A hard reset to origin is the only recovery, but it is
+    // destructive — only safe on a dedicated team-repo clone. On a business-repo
+    // subdir it would bubble up to the user's repo, so bail and surface the cause.
+    const dedicated = await isDedicatedRepoRoot(localPath);
+    if (!dedicated) {
+      throw err;
+    }
+    const reason = err instanceof Error ? err.message : String(err);
+    log.debug(`ff-only pull failed (${branch}), attempting fetch + hard reset: ${reason}`);
+    await git.fetch(['origin', branch]);
+
+    let ahead = 0;
+    try {
+      const out = (await git.raw(['rev-list', '--count', `origin/${branch}..HEAD`])).trim();
+      ahead = Number.parseInt(out, 10) || 0;
+    } catch {
+      // best-effort count; proceed with the reset regardless
+    }
+    const status = await git.status();
+    // `reset --hard` discards tracked changes (and ahead commits) but leaves
+    // untracked files in place, so count tracked changes only — every changed
+    // path appears once in status.files; subtract the untracked (not_added) ones.
+    const dirtyCount = status.files.length - status.not_added.length;
+    if (ahead > 0 || dirtyCount > 0) {
+      log.warn(
+        `Team repo diverged from origin/${branch}; realigning discards `
+        + `${ahead} local commit(s) and ${dirtyCount} uncommitted change(s).`,
+      );
+    }
+    await git.reset(['--hard', `origin/${branch}`]);
+    return 'reset to origin (diverged)';
   }
-  return `${result.summary.changes} file(s) changed`;
 }
 
 /**
@@ -270,6 +323,39 @@ export async function pushRepoDirectly(localPath: string, message: string, files
   // Use --set-upstream for first push on repos initialized from empty remotes
   const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
   await git.push(['-u', 'origin', branch]);
+}
+
+/**
+ * Push the branch holding a just-copied learning file to origin and confirm it
+ * landed. Unlike pushRepoDirectly (whose push is skipped when nothing is newly
+ * staged), this always pushes whatever commits the branch is ahead by — covering
+ * a learning that a prior failed contribute already committed but never pushed —
+ * and reports success only once origin/<branch> actually contains it.
+ *
+ * @param repoPath - Dedicated team-repo clone root (never a business-repo subdir).
+ * @param filename - Learning file name under `learnings/`.
+ * @param message - Commit message used when the file is newly staged.
+ * @returns True when, after the push, the local branch is no longer ahead of
+ *   origin/<branch> (the learning is confirmed on the remote). False when it is
+ *   still ahead. Throws if the push itself fails (offline) so the caller keeps
+ *   its durable backup.
+ */
+export async function pushLearningToOrigin(
+  repoPath: string,
+  filename: string,
+  message: string,
+): Promise<boolean> {
+  const git = createGit(repoPath);
+  await git.add([`learnings/${filename}`]);
+  const status = await git.status();
+  if (status.staged.length > 0) {
+    await git.commit(message);
+  }
+  const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+  await git.push(['origin', branch]);
+  await git.fetch(['origin', branch]);
+  const ahead = (await git.raw(['rev-list', '--count', `origin/${branch}..HEAD`])).trim();
+  return ahead === '0' || ahead === '';
 }
 
 /**
@@ -349,23 +435,61 @@ export function isMetadataOnlyDiff(diff: string): boolean {
 }
 
 /**
+ * Check whether a branch still exists on the `origin` remote.
+ *
+ * Used to decide whether a recorded push branch is still alive (its PR is open)
+ * or has been merged/closed and deleted. Returns null when the remote cannot be
+ * reached, so callers can distinguish "gone" from "unknown".
+ */
+export async function remoteBranchExists(
+  localPath: string,
+  branchName: string,
+): Promise<boolean | null> {
+  try {
+    const out = await createGit(localPath).listRemote(['--heads', 'origin', `refs/heads/${branchName}`]);
+    return out.trim().length > 0;
+  } catch (e) {
+    log.debug(`ls-remote failed for ${branchName}: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+/**
  * Create a new branch, commit files, and push the branch to remote.
  * Returns false if there are no changes to commit (or only metadata changes).
  * Leaves the local repo on the new branch after pushing so that
  * the provider's createPullRequest (which may internally push HEAD)
  * sees the correct branch.
  * Callers should call `checkoutMaster()` when they are done.
+ *
+ * With `opts.reuseBranch`, `branchName` is an existing remote branch backing an
+ * open PR: the branch is rebuilt from the current default branch and
+ * force-pushed, which updates that PR in place instead of opening another one.
+ * If the rebuilt tree matches what the remote branch already holds, nothing is
+ * pushed and the function returns false.
  */
 export async function pushRepoBranch(
   localPath: string,
   message: string,
   files: string[],
   branchName: string,
+  opts: { reuseBranch?: boolean } = {},
 ): Promise<boolean> {
   const git = createGit(localPath);
 
-  // Create and switch to new branch
-  await git.checkoutLocalBranch(branchName);
+  if (opts.reuseBranch) {
+    // Fetch so the tree comparison below can see the remote branch's content.
+    try {
+      await git.fetch(['origin', branchName]);
+    } catch (e) {
+      log.debug(`Could not fetch ${branchName}: ${(e as Error).message}`);
+    }
+    // -B resets a leftover local branch of the same name onto the default branch.
+    await git.checkout(['-B', branchName]);
+  } else {
+    // Create and switch to new branch
+    await git.checkoutLocalBranch(branchName);
+  }
 
   // Stage files
   await git.add(files);
@@ -377,8 +501,7 @@ export async function pushRepoBranch(
     await git.clean('f', ['-d']);
     const defaultBranch = await getDefaultBranch(localPath);
     log.debug(`Nothing to commit, switching back to ${defaultBranch}`);
-    await switchToDefaultBranch(git, defaultBranch);
-    await git.deleteLocalBranch(branchName, true);
+    await leaveAndDeletePushBranch(git, defaultBranch, branchName);
     return false;
   }
 
@@ -389,16 +512,43 @@ export async function pushRepoBranch(
     await git.clean('f', ['-d']);
     const defaultBranch = await getDefaultBranch(localPath);
     log.debug(`Only metadata/timestamp changes detected, switching back to ${defaultBranch}`);
-    await switchToDefaultBranch(git, defaultBranch);
-    await git.deleteLocalBranch(branchName, true);
+    await leaveAndDeletePushBranch(git, defaultBranch, branchName);
     return false;
   }
 
   // Commit and push branch
   await git.commit(message);
+
+  if (opts.reuseBranch) {
+    // Re-running push with no real change would otherwise force-push an
+    // identical tree under a new commit sha, spamming the open PR.
+    if (await treeMatchesRemoteBranch(git, branchName)) {
+      log.debug(`Remote branch ${branchName} already holds this tree, skipping force-push`);
+      const defaultBranch = await getDefaultBranch(localPath);
+      await leaveAndDeletePushBranch(git, defaultBranch, branchName);
+      return false;
+    }
+    await git.push(['--force-with-lease', '-u', 'origin', branchName]);
+    return true;
+  }
+
   await git.push(['-u', 'origin', branchName]);
 
   return true;
+}
+
+/**
+ * Compare the tree of the currently checked-out branch with the tree of its
+ * remote counterpart. Returns false when the remote ref is unknown locally.
+ */
+async function treeMatchesRemoteBranch(git: SimpleGit, branchName: string): Promise<boolean> {
+  try {
+    const local = (await git.revparse([`${branchName}^{tree}`])).trim();
+    const remote = (await git.revparse([`refs/remotes/origin/${branchName}^{tree}`])).trim();
+    return local.length > 0 && local === remote;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -412,17 +562,40 @@ export async function pushRepoBranch(
  * clone a skipped switch self-heals via resetToCleanMaster on the next run. So we
  * swallow that specific conflict rather than letting it abort the whole operation.
  */
-async function switchToDefaultBranch(git: SimpleGit, defaultBranch: string): Promise<void> {
+async function switchToDefaultBranch(git: SimpleGit, defaultBranch: string): Promise<boolean> {
   try {
     await git.checkout(defaultBranch);
+    return true;
   } catch (e) {
     const msg = (e as Error).message ?? '';
     if (/already (used|checked out) by worktree|is already checked out/i.test(msg)) {
       log.debug(`Skipping switch to ${defaultBranch}: already checked out in another worktree`);
-      return;
+      return false;
     }
     throw e;
   }
+}
+
+/**
+ * Leave the push branch for the default branch, then delete the push branch.
+ *
+ * When switchToDefaultBranch could not actually leave (the default branch is
+ * held by another worktree, so HEAD is still on branchName), the delete is
+ * skipped: `git branch -D branchName` refuses to drop the currently checked-out
+ * branch and would throw an uncaught git error out of the caller. The stray
+ * branch self-heals via resetToCleanMaster on the next run.
+ */
+async function leaveAndDeletePushBranch(
+  git: SimpleGit,
+  defaultBranch: string,
+  branchName: string,
+): Promise<void> {
+  const switched = await switchToDefaultBranch(git, defaultBranch);
+  if (!switched) {
+    log.debug(`Leaving ${branchName} in place: default branch busy in another worktree`);
+    return;
+  }
+  await git.deleteLocalBranch(branchName, true);
 }
 
 /**
@@ -486,6 +659,75 @@ export async function isDedicatedRepoRoot(repoPath: string): Promise<boolean> {
 }
 
 /**
+ * The two path anchors teamai derives from a git checkout (issue #374).
+ *
+ * These are deliberately distinct because a git worktree has two different
+ * "roots":
+ *  - `workspaceRoot` is the CURRENT checkout (`git rev-parse --show-toplevel`).
+ *    Each worktree has its own. This is where project-scope AI-tool resources
+ *    (skills/rules/agents) must be written, because every tool discovers them by
+ *    scanning up from the launch directory to the current repository root — it
+ *    does NOT follow `git-common-dir` back to the main checkout.
+ *  - `projectAnchor` is the MAIN checkout, shared by the main repo and all of its
+ *    worktrees (the first entry of `git worktree list --porcelain`). This is the
+ *    stable per-project identity that P1 will use to key machine-local data under
+ *    `~/.teamai/projects/<slug>/`.
+ *
+ * For a plain (non-worktree) repository the two are identical.
+ */
+export interface ProjectAnchors {
+  workspaceRoot: string;
+  projectAnchor: string;
+}
+
+/**
+ * Resolve the {@link ProjectAnchors} for `cwd` (defaults to the process cwd).
+ *
+ * Returns `null` when `cwd` is not inside a git repository, or when git cannot
+ * resolve the anchors — callers fall back to their existing cwd-based behavior.
+ *
+ * Implementation notes:
+ *  - `workspaceRoot` is `--show-toplevel` (the current checkout).
+ *  - `projectAnchor` is the MAIN worktree, taken from the FIRST entry of
+ *    `git worktree list --porcelain` (git always lists the main worktree first).
+ *    Every linked worktree reports the same first entry, so all worktrees of a
+ *    repo share one anchor. This is deliberately NOT `dirname(--git-common-dir)`:
+ *    that breaks for `git init --separate-git-dir`, where the common dir lives
+ *    outside the checkout and its parent (e.g. a shared `gitdirs/`) would collide
+ *    across unrelated repos. The porcelain first entry stays a stable, distinct
+ *    identity in that case.
+ *  - Both anchors are realpath-normalized so a symlinked prefix (macOS `/tmp` →
+ *    `/private/tmp`) does not make the same checkout look like two different ones.
+ *    Case-insensitive-filesystem normalization is intentionally NOT done here; it
+ *    is only needed for the P1 slug hash and belongs with that change.
+ */
+export async function resolveAnchors(cwd?: string): Promise<ProjectAnchors | null> {
+  const git = createGit(cwd);
+  let toplevel: string;
+  let mainWorktree: string;
+  try {
+    toplevel = (await git.revparse(['--show-toplevel'])).trim();
+    const list = await git.raw(['worktree', 'list', '--porcelain']);
+    // The first `worktree <path>` line is the main worktree, shared by all
+    // linked worktrees of this repository.
+    const first = list.split('\n').find((l) => l.startsWith('worktree '));
+    mainWorktree = first ? first.slice('worktree '.length).trim() : '';
+  } catch {
+    return null;
+  }
+  if (!toplevel || !mainWorktree) return null;
+  try {
+    const [workspaceRoot, projectAnchor] = await Promise.all([
+      realpath(toplevel),
+      realpath(mainWorktree),
+    ]);
+    return { workspaceRoot, projectAnchor };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Reset the team repo to a clean default-branch state.
  *
  * The team repo is a local cache — any uncommitted or conflicted state is
@@ -531,7 +773,7 @@ export async function resetToCleanMaster(git: SimpleGit, localPath?: string): Pr
   }
   if (branch !== defaultBranch) {
     log.debug(`Switching from stale branch '${branch}' back to ${defaultBranch}`);
-    await git.checkout(defaultBranch);
+    await switchToDefaultBranch(git, defaultBranch);
   }
 }
 

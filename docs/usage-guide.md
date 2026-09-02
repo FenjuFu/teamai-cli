@@ -76,7 +76,7 @@ teamai --version
 
 > Only one admin needs to do this — other members can skip to [Member Onboarding](#member-onboarding).
 
-Create an empty repository on GitHub, GitLab (gitlab.com or a self-hosted instance), CNB (cnb.cool), TGit (Tencent's internal Git host), or any private/self-hosted Git service (suggested naming: `TeamAi-<team-name>`), or simply run `teamai init` — if the repo doesn't exist yet, you'll be prompted to create it automatically.
+Create an empty repository on GitHub, GitLab (gitlab.com or a self-hosted instance), GitCode (gitcode.com), CNB (cnb.cool), TGit (Tencent's internal Git host), or any private/self-hosted Git service (suggested naming: `TeamAi-<team-name>`), or simply run `teamai init` — if the repo doesn't exist yet, you'll be prompted to create it automatically.
 
 ### Project Scope (default)
 
@@ -300,7 +300,7 @@ teamai pull              # Manual pull
 teamai pull --dry-run    # Dry run, no actual changes
 ```
 
-> Project scope is isolated by default. When the current working directory contains a project-scope `.teamai/config.yaml`, `pull` processes that project and skips user scope unless the local config has `inheritUserScope: true`; in that case it first refreshes the safe user-resource channel. Without a project config in the current directory, `pull` processes user scope. User `env`, hooks, MCP definitions, sources, reporting, and writes remain isolated in project mode.
+> Project scope is isolated by default. When the current working directory contains a project-scope `.teamai/config.yaml`, `pull` processes that project and skips user scope unless the local config has `inheritUserScope: true`; in that case it first refreshes the safe user-resource channel. Without a project config in the current directory, `pull` processes user scope. User `env`, MCP definitions, sources, reporting, and writes remain isolated in project mode. Hooks are the one exception: a project scope's hooks are injected into your **HOME** tool settings (`~/.claude/settings.json`, …), not `<projectRoot>`, because the built-in hooks gate on the `cwd` handed to `hook-dispatch` and `~/.claude` always exists so the "installed tool" gate passes (see the Hooks section). Self single-repo mode keeps its hooks in the business repo so they travel on clone.
 
 With role-based skills enabled, `pull`'s skill sync source becomes the contents of `skills/<namespace>/`, expanded according to `primaryRole + additionalRoles` and flattened into each local AI tool's skills directory. `rules/`, `docs/`, and `learnings/` keep their original global sync behavior.
 
@@ -349,7 +349,9 @@ Choose namespace [1-3] (default: 1 = common):
 - A single namespace is auto-selected; `--silent` mode uses the default
 - Modifying an existing skill automatically keeps its original namespace
 
-**Automatic YAML frontmatter completion:** When pushing, the CLI automatically checks `SKILL.md` and fills in `name`/`description` if missing — no manual upkeep required.
+**Updating an open PR instead of duplicating it:** If a resource is already waiting in an unmerged PR, re-running `teamai push` on it updates that existing PR in place (by force-pushing its branch) rather than opening a duplicate. Keep the resource selected to update its PR; deselect it to leave the PR untouched. Unrelated resources selected in the same run go into their own new PR. Once the PR merges (or its branch is removed from the remote), the record is cleared and the next push opens a fresh PR as usual.
+
+**Automatic YAML frontmatter completion:** When pushing, the CLI automatically checks valid mapping-style `SKILL.md` frontmatter and fills in `name`/`description` if missing. Malformed or scalar frontmatter is left unchanged with a warning and must be fixed manually.
 
 ### Check status
 
@@ -433,6 +435,8 @@ teamai push --role pm
 > tags: [deploy, automation]
 > ---
 > ```
+>
+> Malformed YAML or a non-mapping frontmatter root is preserved unchanged and reported as a warning; fix it manually before pushing again.
 
 With role-based skills enabled, the push target directory becomes:
 
@@ -575,6 +579,137 @@ teamai recall status     # View the current effective status (team default + use
 ```
 
 When disabled, `teamai pull` skips deploying the recall subagent, the recall rules injection block, and the TodoWrite reminder hook. Manually running `teamai recall <query>` to search is not affected by this switch.
+
+### Knowledge Base Maintenance
+
+Over time, some learnings accumulate low confidence scores (nobody upvoted them) or become stale. `teamai recall maintenance` keeps the knowledge base healthy:
+
+| Flag | Description |
+|------|-------------|
+| `--prune` | Find learnings below the confidence threshold and remove them |
+| `--threshold <n>` | Confidence threshold for pruning (default: `0.15`) |
+| `--archive` | Move pruned entries to `archive/` instead of deleting permanently |
+| `--confidence-writeback` | Recompute confidence scores from vote history and write them back to frontmatter |
+| `--update-quality` | Identify high-recall but low-approval docs/rules/skills and generate AI-powered update drafts (`.draft.md` files) |
+| `--dry-run` | Preview what would be done without making any changes |
+
+```bash
+# Preview stale entries without changing anything
+teamai recall maintenance --prune --dry-run
+
+# Archive low-confidence learnings (confidence < 0.15)
+teamai recall maintenance --prune --archive
+
+# Rewrite confidence scores to frontmatter based on current votes
+teamai recall maintenance --confidence-writeback
+
+# Find stale entries and generate update drafts
+teamai recall maintenance --update-quality
+```
+
+After `--update-quality`, review the generated `.draft.md` files and rename them to `.md` to apply the updates.
+
+### Promoting Learnings
+
+When a learning reaches maturity, promote it to formal team knowledge (a skill, rule, or doc). Promotion criteria: confidence ≥ 0.90, ≥ 5 upvotes, ≥ 2 distinct contributors, age ≥ 14 days.
+
+```bash
+# List all promotion candidates
+teamai recall promote
+
+# Promote a specific learning (AI rewrites it into the target format)
+teamai recall promote <learningId>
+
+# Promote to a specific category
+teamai recall promote <learningId> --category skills
+
+# Preview what would happen without writing files
+teamai recall promote <learningId> --dry-run
+```
+
+Options:
+
+| Option | Description |
+|--------|-------------|
+| `--category <cat>` | Target category: `skills` \| `rules` \| `docs` |
+| `--dry-run` | Show what would be done without making changes |
+
+---
+
+## Knowledge Base Health Report
+
+The dashboard includes a built-in **KB Health** report page showing your team knowledge base's usage and health, covering everything captured by `teamai recall` votes, learnings, docs, rules, and skills.
+
+```bash
+# Start the dashboard, then click "KB Health" in the header
+teamai dashboard
+
+# The report is served directly at:
+#   http://localhost:3721/kb-report
+```
+
+The report aggregates your local `~/.teamai` knowledge base (or the configured team repo) and renders on demand — no flags to pass.
+
+### What the Report Shows
+
+| Section | Description |
+|---------|-------------|
+| **Overview cards** | Total entries, total recalls, overall coverage %, contributors |
+| **Coverage by type** | Breakdown of recall coverage across skills, rules, docs, learnings |
+| **Top recalled** | Ranked list of most frequently recalled entries |
+| **Silent entries** | Entries that have never been recalled — candidates for pruning or rewriting |
+| **Recall trend** | Recall activity over time |
+| **Author contributions** | Per-contributor entry counts and recall share |
+| **Maintenance console** | Three action zones: entries ready to promote, entries suggested for archiving, and stale entries needing updates — each with a copyable command |
+
+### Typical Workflow
+
+```
+Open the dashboard → KB Health page
+   ↓
+Review the Maintenance Console
+   ↓
+Promote mature learnings:
+   teamai recall promote <learningId>
+   ↓
+Archive low-value entries:
+   teamai recall maintenance --prune --archive
+   ↓
+Update stale docs/rules/skills:
+   teamai recall maintenance --update-quality
+   (review .draft.md → rename to .md)
+   ↓
+teamai push   # share the cleaned-up knowledge base with the team
+```
+
+---
+
+## Commit Co-Author Attribution
+
+AI coding tools stamp a `Co-Authored-By:` / attribution trailer on the commits they make. Teams that prefer a clean history can turn this off for everyone; individual members can still override it on their own machine. `teamai pull` applies the resolved intent to each installed tool's own config file.
+
+The feature is controlled by the same two-tier pattern as recall:
+
+| Tier | Config file | Field | Description |
+|------|----------|------|------|
+| Team default | `teamai.yaml` | `sharing.coAuthor.enabled` | `true` = keep the trailer / `false` = strip it. Omit the block entirely for "no opinion" (teamai touches nothing) |
+| User override | `~/.teamai/config.yaml` | `coAuthorEnabled` | `true` / `false`, takes priority over the team default |
+
+Per tool family, the trailer maps to a different setting:
+
+| Tool family | File | Setting written | Scope | Reliability |
+|------|------|------|------|------|
+| Claude (`claude`, `codebuddy`, `workbuddy`) | `settings.json` | `attribution.commit` / `attribution.pr` set to `""` | user **or** project (follows the active scope) | Deterministic |
+| Codex (`codex`) | `~/.codex/config.toml` | `commit_attribution = ""` | user only | Best-effort — only takes effect when `[features].codex_git_commit = true`, which teamai does not force |
+| Cursor | `~/.cursor/cli-config.json` | `attribution.attributeCommitsToAgent = false` | user only | Best-effort — a [known upstream bug](https://forum.cursor.com/t/local-executor-ignores-cli-config-attribution-opt-out-forcing-co-authored-by-trailer/167722) can cause the local executor to ignore this |
+
+Semantics:
+
+- **Write-only, never delete.** Once teamai has written a value, dropping the team policy later leaves that value untouched — teamai never restores a trailer it stripped. To re-enable, set the intent back to `true` explicitly (which removes teamai's override so the tool's own default returns).
+- **Idempotent.** teamai records what it last wrote per file (in `state.json` under `coAuthorManaged`) and skips a write when nothing would change.
+- **Only installed tools are touched**, and existing keys/comments in each config file are preserved (key-level surgery, not regenerate-from-scratch).
+
+Restart your AI tool session after a `pull` for the change to take effect.
 
 ---
 
@@ -774,6 +909,7 @@ Configurable environment variables:
 | `TEAMAI_SKILL_DOWNLOAD_HOSTS` | Allowlist of hosts for skill `download_url` (empty = allow all) |
 | `TEAMAI_ALLOW_SANDBOX_REPORT` | Set to `1` to force report/sync inside a CloudStudio sandbox (see note below) |
 | `TEAMAI_DISABLE_REMOTE_CMD` | Set to `1` to reject server-pushed `uninstall_teamai`, `install_hook_rule`, and `uninstall_hook_rule` commands (they are acked `failed`) |
+| `TEAMAI_SKIP_AST` | Set to `1` to force heuristic-only code extraction, skipping the WASM tree-sitter AST track |
 
 > **Privacy:** The install path and machine id are only hashed locally to derive `local_agent_id` — they are never reported.
 
@@ -814,6 +950,8 @@ teamai import --from-repo https://github.com/org/repo --skip-enrich
 ```
 
 The graph stores components, interfaces, configs, and cross-repo dependencies. `teamai recall` uses the graph for BM25 + graph-boosted ranking.
+
+Dependency edges are extracted by two parallel tracks: a WASM tree-sitter **AST track** (TypeScript/JavaScript, Python, Go) that resolves imports, calls, and TS `implements` clauses to precise file-to-file edges (`code-ast`), and a regex **heuristic track** (all languages, `code-heuristic`) that also covers languages the AST track does not. AST results win on overlap. The AST parser needs no native toolchain; on load failure, extraction falls back to heuristics and records an `AST_UNAVAILABLE` gap. Set `TEAMAI_SKIP_AST=1` to force heuristic-only extraction.
 
 ```bash
 # Graph health check
@@ -892,6 +1030,8 @@ teamai hooks remove    # Remove
 
 Both commands only touch tools you actually have installed (i.e. whose `~/.<tool>/` root directory already exists). They never create root directories for tools listed in `toolPaths` but not installed.
 
+> **Codex trust gate** — Codex (the OpenAI / ChatGPT Codex app, tool id `codex`) gates non-managed hooks behind an explicit user trust step. After teamai writes `~/.codex/hooks.json`, Codex may skip a newly added or changed hook until you review/trust it in `/hooks` or Settings → Hooks. `teamai hooks inject` and `teamai doctor` print a reminder when Codex hooks are installed; teamai never edits Codex's `[hooks.state]` to auto-trust — trusting is left to you. (The internal variants `codex-internal` / `tcodex` share the hooks.json format but have no trust gate, so no reminder is shown for them.)
+
 ### Team Hooks Declaration
 
 A team can declare custom hooks in the repo's `hooks/hooks.yaml`; `teamai pull` automatically distributes them to all members' AI tools:
@@ -949,6 +1089,22 @@ team-repo/
 - **Rules** are copied into `.opencode/rules/` (or `~/.config/opencode/rules/`), but OpenCode does not auto-scan a rules directory — the files are inert until referenced. teamai therefore adds a `rules/*.md` glob to the `instructions` array in `opencode.json` and removes it again when the team's last rule goes away, editing only that one key and leaving your own `instructions` entries untouched.
 - **Hooks** are delivered as an OpenCode *plugin*, not a settings-file entry — OpenCode has no `hooks` array; it auto-loads JS/TS plugins from **both** `~/.config/opencode/plugin/` and `<project>/.opencode/plugin/`. A plugin present in both dirs is loaded twice and would dispatch every event twice, so teamai keeps exactly one copy: `teamai-hooks.ts` in the user dir, which covers every project. Any project-scope copy left by an earlier layout is deleted on the next sync. This matches the other tools, whose `settings.json` hooks also live in HOME and gate on the `cwd` handed to `hook-dispatch`. The plugin subscribes to OpenCode's own events and shelling out to the same `teamai hook-dispatch` entry point every other tool uses. The event mapping mirrors the Claude built-in set: `session.created` → session-start, `session.idle` → stop, `chat.message` → prompt-submit, `tool.execute.after` → post-tool-use. The plugin forwards the same STDIN payload other agents send (`cwd`, `tool_name`, `tool_input`, `prompt`), and maps OpenCode's lowercase tool ids (`skill`, `todowrite`) back to the PascalCase matchers the handler registry expects. OpenCode cannot inject a hook's stdout back into the session, so hooks run purely for their side effects (status report / sync / update). Note that OpenCode *awaits* its named hooks (`chat.message`, `tool.execute.after`), so those dispatches briefly wait on the `teamai` subprocess before the agent continues; the errors are always swallowed so a hook can never fail the session. Server-pushed agent hooks (`teamai-agent-<slug>.ts`) install into the same user plugin dir.
 - **MCP** servers live under the `mcp` key of the shared `opencode.json` (see the MCP section above).
+
+### Cursor
+
+Cursor project rules must live in `.cursor/rules/` as **`.mdc`** files with YAML frontmatter — a plain `.md` file there is silently ignored by Cursor. teamai therefore writes rules to Cursor as `<name>.mdc` (every other tool still gets a plain `.md`), deriving the frontmatter from the team rule:
+
+- A rule scoped with a `paths:` list becomes `globs: "<comma-joined>"` + `alwaysApply: false` (Cursor auto-attaches it when a matching file is in context). The value is quoted because a glob starting with `*` is not valid YAML unquoted.
+- A rule with no `paths` (a mandatory team rule) becomes `alwaysApply: true` (applied to every Cursor chat session).
+
+Only the markdown body crosses between the two formats; each side keeps its own frontmatter. On `pull` the Cursor frontmatter is machine-derived (the body is copied over with leading/trailing blank lines normalized), so a `pull` → `push` round-trip is not seen as a content change. On `push`, editing a rule's body in `.cursor/rules/*.mdc` and running `teamai push` sends **only that body** upstream — the team rule keeps its own `paths:` frontmatter, so the rule's scope is never silently lost.
+
+Two things are deliberately *not* pushed from Cursor's rules directory:
+
+- A `.mdc` file with no matching team rule. `.cursor/rules/` is also where Cursor's own *New Cursor Rule* command writes personal rules, so teamai never offers those as new team resources.
+- The CLI built-in rules, which are deployed (as `.mdc` for Cursor) rather than synced.
+
+Upgrading from an earlier version: `.cursor/rules/*.md` copies written by the old layout are inert — Cursor never read them — so `pull`, `remove`, and `uninstall` delete them alongside the `.mdc` file. A `.md` you put there yourself is left alone.
 
 ### Miscellaneous
 
@@ -1053,6 +1209,8 @@ sharing:
     localDir: ./.teamai/docs
   env:
     injectShellProfile: true
+  coAuthor:
+    enabled: false             # optional; strip AI-tool commit trailers team-wide
 ```
 
 ### config.yaml (local config)
@@ -1066,6 +1224,7 @@ updatePolicy: auto
 scope: project                 # project (default from init) or user
 projectRoot: /path/to/project  # project scope only
 inheritUserScope: true         # optional; project scope only, defaults to false
+coAuthorEnabled: true          # optional; per-machine co-author override
 ```
 
 ---
@@ -1118,7 +1277,7 @@ teamai pull
 
 **Q: Can user scope and project scope coexist?**
 
-Yes, but project scope remains isolated by default. When the current working directory contains a project-scope config, it is active and user scope is skipped. Initialize user scope first, then initialize the project with `--inherit-user-scope` (or set `inheritUserScope: true` in the project's local config) to compose safe resources and Recall results. Executable and control-plane configuration remains project-only.
+Yes, but project scope remains isolated by default. When the current working directory contains a project-scope config, it is active and user scope is skipped. Initialize user scope first, then initialize the project with `--inherit-user-scope` (or set `inheritUserScope: true` in the project's local config) to compose safe resources and Recall results. Executable and control-plane configuration (`env`, MCP) remains project-only; hooks are the exception — a non-self project scope injects them into HOME so `hook-dispatch` can gate on `cwd` (see the Hooks section).
 
 **Q: `teamai init` says it's already initialized?**
 

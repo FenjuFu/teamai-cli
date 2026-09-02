@@ -10,6 +10,13 @@ const mockAppendEvent = vi.fn().mockResolvedValue(undefined);
 const mockTrackFromParsed = vi.fn().mockResolvedValue(undefined);
 const mockTrackSlashFromParsed = vi.fn().mockResolvedValue(undefined);
 const mockContributeCheckForSession = vi.fn().mockResolvedValue({ hint: null });
+const mockTakePendingHint = vi.fn().mockResolvedValue(null);
+const mockTakePendingVotesHint = vi.fn().mockResolvedValue(null);
+const mockStashVotesHint = vi.fn().mockResolvedValue(undefined);
+const mockClaimVotesNudge = vi.fn().mockResolvedValue(true);
+const mockParseTranscriptForVotes = vi.fn().mockResolvedValue({ referencedDocIds: [], recalledDocIds: [] });
+const mockIncrementUpvoted = vi.fn().mockResolvedValue(undefined);
+const mockSyncVotesToTeam = vi.fn().mockResolvedValue(false);
 const mockDoUpdate = vi.fn().mockResolvedValue(undefined);
 const mockReportAndSyncFromHook = vi.fn().mockResolvedValue(null);
 
@@ -36,6 +43,10 @@ vi.mock('../usage-tracker.js', () => ({
 vi.mock('../contribute-check.js', () => ({
   contributeCheck: vi.fn().mockResolvedValue(undefined),
   contributeCheckForSession: mockContributeCheckForSession,
+  takePendingHint: mockTakePendingHint,
+  takePendingVotesHint: mockTakePendingVotesHint,
+  stashVotesHint: mockStashVotesHint,
+  claimVotesNudge: mockClaimVotesNudge,
 }));
 
 vi.mock('../update.js', () => ({
@@ -58,6 +69,15 @@ vi.mock('../local-agent.js', () => ({
   reportAndSyncFromHook: mockReportAndSyncFromHook,
 }));
 
+vi.mock('../transcript-parser.js', () => ({
+  parseTranscriptForVotes: mockParseTranscriptForVotes,
+}));
+
+vi.mock('../votes.js', () => ({
+  incrementUpvoted: mockIncrementUpvoted,
+  syncVotesToTeam: mockSyncVotesToTeam,
+}));
+
 const mockSeedProjectAgentRoot = vi.fn().mockResolvedValue(undefined);
 vi.mock('../project-agent-root.js', () => ({
   seedProjectAgentRoot: mockSeedProjectAgentRoot,
@@ -71,6 +91,8 @@ import { createDispatcher } from '../hook-dispatch.js';
 describe('hook-handlers registry', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockParseTranscriptForVotes.mockResolvedValue({ referencedDocIds: [], recalledDocIds: [] });
+    mockClaimVotesNudge.mockResolvedValue(true);
   });
 
   it('returns registrations for all expected events', () => {
@@ -104,6 +126,31 @@ describe('hook-handlers registry', () => {
     expect(mockSeedProjectAgentRoot.mock.invocationCallOrder[0]).toBeLessThan(
       mockPull.mock.invocationCallOrder[0],
     );
+  });
+
+  it('session-start pull seeds from workspace_roots when cwd is absent', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'session-start' && r.handler.name === 'pull',
+    )!.handler;
+
+    await handler.execute({ workspace_roots: ['/tmp/cursor-project'] }, 'cursor');
+
+    expect(mockSeedProjectAgentRoot).toHaveBeenCalledWith('cursor', '/tmp/cursor-project');
+  });
+
+  it('session-start pull prefers cwd over workspace_roots', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'session-start' && r.handler.name === 'pull',
+    )!.handler;
+
+    await handler.execute(
+      { cwd: '/from-cwd', workspace_roots: ['/from-roots'] },
+      'claude',
+    );
+
+    expect(mockSeedProjectAgentRoot).toHaveBeenCalledWith('claude', '/from-cwd');
   });
 
   it('stop has update, contribute-check, and dashboard-report handlers', () => {
@@ -153,7 +200,23 @@ describe('hook-handlers registry', () => {
     mockContributeCheckForSession.mockResolvedValueOnce({ hint: null });
 
     await handler.execute({ session_id: 'sid-abc', cwd: '/x' }, 'claude');
-    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x');
+    // transcriptPath is the third arg; absent from this stdin so it is undefined.
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x', undefined, false);
+  });
+
+  it('contribute-check handler forwards transcript_path so friction is read live', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+
+    mockContributeCheckForSession.mockResolvedValueOnce({ hint: null });
+
+    await handler.execute(
+      { session_id: 'sid-abc', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude',
+    );
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x', '/t/transcript.jsonl', false);
   });
 
   it('contribute-check handler routes hint through formatStopHookOutput for cursor', async () => {
@@ -168,6 +231,74 @@ describe('hook-handlers registry', () => {
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!);
     expect(parsed.followup_message).toBe('[teamai] hello');
+  });
+
+  it('contribute-check handler asks to stash (not stdout) for codebuddy', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+
+    // codebuddy stashes: contributeCheckForSession is called with stash=true and
+    // returns hint:null (it persisted the hint as pendingHint itself).
+    mockContributeCheckForSession.mockResolvedValueOnce({ hint: null });
+
+    const result = await handler.execute({ session_id: 's1', cwd: '/x' }, 'codebuddy');
+    expect(result).toBeNull();
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('s1', '/x', undefined, true);
+  });
+
+  it('contribute-check handler returns stdout hint for claude (unchanged)', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+
+    mockContributeCheckForSession.mockResolvedValueOnce({ hint: '[teamai] do share' });
+
+    const result = await handler.execute({ session_id: 's2', cwd: '/x' }, 'claude');
+    expect(result).not.toBeNull();
+    expect(result).toContain('do share');
+    // claude is not a stash tool: called with stash=false.
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('s2', '/x', undefined, false);
+  });
+
+  it('pending-hint handler injects stashed hint for codebuddy on prompt-submit', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'prompt-submit' && r.handler.name === 'pending-hint',
+    )!.handler;
+
+    mockTakePendingHint.mockResolvedValueOnce('[teamai] stashed');
+
+    const result = await handler.execute({ session_id: 's3', cwd: '/x' }, 'codebuddy');
+    expect(result).not.toBeNull();
+    const parsed = JSON.parse(result!);
+    expect(parsed.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+    expect(parsed.hookSpecificOutput.additionalContext).toBe('[teamai] stashed');
+  });
+
+  it('pending-hint handler is a no-op for claude', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'prompt-submit' && r.handler.name === 'pending-hint',
+    )!.handler;
+
+    const result = await handler.execute({ session_id: 's4', cwd: '/x' }, 'claude');
+    expect(result).toBeNull();
+    expect(mockTakePendingHint).not.toHaveBeenCalled();
+  });
+
+  it('pending-hint handler returns null when no pending hint', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'prompt-submit' && r.handler.name === 'pending-hint',
+    )!.handler;
+
+    mockTakePendingHint.mockResolvedValueOnce(null);
+
+    const result = await handler.execute({ session_id: 's5', cwd: '/x' }, 'codebuddy');
+    expect(result).toBeNull();
   });
 
   it('post-tool-use wildcard has dashboard-report', () => {
@@ -320,6 +451,263 @@ describe('hook-handlers registry', () => {
     expect(filterHandlersForConfig(registry, { repo: { kind: 'git' } } as never).length).toBe(full);
     expect(filterHandlersForConfig(registry, { repo: {} } as never).length).toBe(full);
     expect(filterHandlersForConfig(registry, null).length).toBe(full);
+  });
+
+  // ── Change 2: votes-sync nudge — marker guard removed, nudge every time declared===0 ──
+
+  it('votes-sync nudges on every Stop when recalled>0 and declared===0 (no once-per-session guard)', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+
+    // recalled>0, declared===0 → should always nudge
+    mockParseTranscriptForVotes.mockResolvedValue({
+      referencedDocIds: [],
+      recalledDocIds: ['doc-a'],
+    });
+
+    const result1 = await handler.execute(
+      { session_id: 'sid-votes-1', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude',
+    );
+    expect(result1).not.toBeNull();
+
+    // Same session, same conditions — should nudge again (no marker blocks repeat)
+    const result2 = await handler.execute(
+      { session_id: 'sid-votes-1', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude',
+    );
+    expect(result2).not.toBeNull();
+  });
+
+  it('votes-sync does not nudge when recalled===0', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+
+    mockParseTranscriptForVotes.mockResolvedValue({
+      referencedDocIds: [],
+      recalledDocIds: [],
+    });
+
+    const result = await handler.execute(
+      { session_id: 'sid-votes-2', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude',
+    );
+    expect(result).toBeNull();
+  });
+
+  // ── upvote intersection filter: only recalled docs count ──
+
+  it('votes-sync: incrementUpvoted receives only the intersection of referenced and recalled doc-ids', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+
+    mockParseTranscriptForVotes.mockResolvedValue({
+      referencedDocIds: ['doc-a', 'doc-b', 'doc-c'],
+      recalledDocIds: ['doc-a', 'doc-b'],
+    });
+
+    await handler.execute(
+      { session_id: 'sid-filter-1', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude',
+    );
+
+    expect(mockIncrementUpvoted).toHaveBeenCalledOnce();
+    expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-a', 'doc-b']);
+  });
+
+  it('votes-sync: incrementUpvoted is not called when no referenced doc-id was actually recalled', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+
+    mockParseTranscriptForVotes.mockResolvedValue({
+      referencedDocIds: ['doc-x'],
+      recalledDocIds: ['doc-a', 'doc-b'],
+    });
+
+    await handler.execute(
+      { session_id: 'sid-filter-2', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude',
+    );
+
+    expect(mockIncrementUpvoted).not.toHaveBeenCalled();
+  });
+
+  it('votes-sync: incrementUpvoted receives all ids when referenced and recalled are identical', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+
+    mockParseTranscriptForVotes.mockResolvedValue({
+      referencedDocIds: ['doc-p', 'doc-q'],
+      recalledDocIds: ['doc-p', 'doc-q'],
+    });
+
+    await handler.execute(
+      { session_id: 'sid-filter-3', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude',
+    );
+
+    expect(mockIncrementUpvoted).toHaveBeenCalledOnce();
+    expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-p', 'doc-q']);
+  });
+
+  it('votes-sync: incrementUpvoted is not called when recalledDocIds is empty', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+
+    mockParseTranscriptForVotes.mockResolvedValue({
+      referencedDocIds: ['doc-a'],
+      recalledDocIds: [],
+    });
+
+    await handler.execute(
+      { session_id: 'sid-filter-empty-recalled', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude',
+    );
+
+    expect(mockIncrementUpvoted).not.toHaveBeenCalled();
+  });
+
+  // ── Change 3: votes-sync stash branch (STOP_STDOUT_UNSUPPORTED_TOOLS) ──
+
+  it('votes-sync stashes nudge via stashVotesHint for codebuddy (stdout ignored)', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+
+    mockParseTranscriptForVotes.mockResolvedValue({
+      referencedDocIds: [],
+      recalledDocIds: ['doc-b'],
+    });
+
+    const result = await handler.execute(
+      { session_id: 'sid-votes-stash', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'codebuddy',
+    );
+    // Stash path returns null (hint goes to the votes-hint sidecar)
+    expect(result).toBeNull();
+    expect(mockStashVotesHint).toHaveBeenCalledOnce();
+    const [calledSessionId, calledMsg] = mockStashVotesHint.mock.calls[0];
+    expect(calledSessionId).toBe('sid-votes-stash');
+    expect(calledMsg).toContain('doc-b');
+  });
+
+  it('votes-sync returns stdout nudge for claude (not a stash tool)', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+
+    mockParseTranscriptForVotes.mockResolvedValue({
+      referencedDocIds: [],
+      recalledDocIds: ['doc-c'],
+    });
+
+    const result = await handler.execute(
+      { session_id: 'sid-votes-stdout', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude',
+    );
+    expect(result).not.toBeNull();
+    expect(mockStashVotesHint).not.toHaveBeenCalled();
+  });
+
+  it('votes-sync caps Cursor follow-up nudges to once per session', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+    mockParseTranscriptForVotes.mockResolvedValue({
+      referencedDocIds: [],
+      recalledDocIds: ['doc-cursor'],
+    });
+    mockClaimVotesNudge
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+
+    const stdin = { session_id: 'sid-cursor', cwd: '/x', transcript_path: '/t/transcript.jsonl' };
+    expect(await handler.execute(stdin, 'cursor')).not.toBeNull();
+    expect(await handler.execute(stdin, 'cursor')).toBeNull();
+    expect(mockClaimVotesNudge).toHaveBeenCalledTimes(2);
+  });
+
+  it('stop dispatcher preserves both votes and contribute hints', async () => {
+    mockParseTranscriptForVotes.mockResolvedValue({
+      referencedDocIds: [],
+      recalledDocIds: ['doc-a'],
+    });
+    mockContributeCheckForSession.mockResolvedValueOnce({ hint: 'CONTRIBUTE-HINT' });
+    const dispatcher = createDispatcher({ handlers: buildHandlerRegistry() });
+
+    const result = await dispatcher.dispatch(
+      'stop',
+      '*',
+      { session_id: 'sid-merged-stop', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
+      'claude',
+      'foreground',
+    );
+
+    const context = JSON.parse(result.output!).hookSpecificOutput.additionalContext;
+    expect(context).toContain('doc-a');
+    expect(context).toContain('CONTRIBUTE-HINT');
+  });
+
+  // ── Change 3: pending-hint replays and merges the votes hint ──
+
+  it('pending-hint merges contribute hint and votes hint for codebuddy', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'prompt-submit' && r.handler.name === 'pending-hint',
+    )!.handler;
+
+    mockTakePendingHint.mockResolvedValueOnce('[teamai] contribute hint');
+    mockTakePendingVotesHint.mockResolvedValueOnce('[teamai] votes hint');
+
+    const result = await handler.execute({ session_id: 'sid-merge', cwd: '/x' }, 'codebuddy');
+    expect(result).not.toBeNull();
+    const parsed = JSON.parse(result!);
+    const ctx = parsed.hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('[teamai] contribute hint');
+    expect(ctx).toContain('[teamai] votes hint');
+  });
+
+  it('pending-hint delivers only votes hint when contribute hint is absent', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'prompt-submit' && r.handler.name === 'pending-hint',
+    )!.handler;
+
+    mockTakePendingHint.mockResolvedValueOnce(null);
+    mockTakePendingVotesHint.mockResolvedValueOnce('[teamai] votes only');
+
+    const result = await handler.execute({ session_id: 'sid-votes-only', cwd: '/x' }, 'codebuddy');
+    expect(result).not.toBeNull();
+    const parsed = JSON.parse(result!);
+    expect(parsed.hookSpecificOutput.additionalContext).toBe('[teamai] votes only');
+  });
+
+  it('pending-hint returns null when both hints are absent', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'prompt-submit' && r.handler.name === 'pending-hint',
+    )!.handler;
+
+    mockTakePendingHint.mockResolvedValueOnce(null);
+    mockTakePendingVotesHint.mockResolvedValueOnce(null);
+
+    const result = await handler.execute({ session_id: 'sid-both-absent', cwd: '/x' }, 'codebuddy');
+    expect(result).toBeNull();
   });
 });
 
