@@ -16,6 +16,7 @@ import type { LocalConfig } from './types.js';
 import { deriveSessionId } from './utils/session-id.js';
 import { log } from './utils/logger.js';
 import { normalizeToolName } from './utils/tool-names.js';
+import { resolveHookCwd } from './utils/hook-cwd.js';
 
 // ─── Public types ───────────────────────────────────────
 
@@ -83,7 +84,7 @@ const LOCAL_AGENT_TIMEOUT_MS = 15_000;
 const pullHandler: HookHandler = {
   name: 'pull',
   async execute(stdin, tool) {
-    const cwd = typeof stdin.cwd === 'string' ? stdin.cwd : undefined;
+    const cwd = resolveHookCwd(stdin);
     try {
       const { seedProjectAgentRoot } = await import('./project-agent-root.js');
       await seedProjectAgentRoot(tool, cwd);
@@ -186,16 +187,52 @@ const contributeCheckHandler: HookHandler = {
   async execute(stdin, tool) {
     const { contributeCheckForSession } = await import('./contribute-check.js');
     const { formatStopHookOutput } = await import('./utils/hook-output.js');
+    const { STOP_STDOUT_UNSUPPORTED_TOOLS } = await import('./utils/tool-names.js');
 
     // Match dashboard-collector's derivation so events and contribute state
     // share the same session id even when stdin.session_id is absent.
     const sessionId = deriveSessionId(stdin, { includeCwd: true });
-    const cwd = typeof stdin.cwd === 'string' ? stdin.cwd : undefined;
-    const { hint } = await contributeCheckForSession(sessionId, cwd);
-    if (hint) {
-      return formatStopHookOutput(hint, tool);
-    }
-    return null;
+    const cwd = resolveHookCwd(stdin);
+    const transcriptPath = typeof stdin.transcript_path === 'string' ? stdin.transcript_path : undefined;
+    // Tools whose Stop hook ignores stdout: the hint is stashed (within the same
+    // single state write inside contributeCheckForSession) for delivery on the
+    // next UserPromptSubmit, so contributeCheckForSession returns null here.
+    const stash = STOP_STDOUT_UNSUPPORTED_TOOLS.has(tool);
+    const { hint } = await contributeCheckForSession(sessionId, cwd, transcriptPath, stash);
+    if (!hint) return null;
+    return formatStopHookOutput(hint, tool);
+  },
+};
+
+/** UserPromptSubmit: deliver a hint stashed at Stop for stdout-less tools. */
+const pendingHintHandler: HookHandler = {
+  name: 'pending-hint',
+  async execute(stdin, tool) {
+    const { STOP_STDOUT_UNSUPPORTED_TOOLS } = await import('./utils/tool-names.js');
+    if (!STOP_STDOUT_UNSUPPORTED_TOOLS.has(tool)) return null;
+
+    const { takePendingHint, takePendingVotesHint } = await import('./contribute-check.js');
+    // Must match contributeCheckHandler's derivation so Stop and UserPromptSubmit
+    // resolve to the same session file. This cross-process handoff relies on
+    // codebuddy/workbuddy sending a stable, consistent session_id on BOTH the
+    // Stop and the next UserPromptSubmit payload — verified against real session
+    // data (a session's stop and prompt_submit events share one sessionId). If a
+    // tool omits session_id, deriveSessionId falls back to pid+cwd, which can
+    // differ across the two hook processes and orphan the stash (best-effort).
+    const sessionId = deriveSessionId(stdin, { includeCwd: true });
+    const hint = await takePendingHint(sessionId);
+    const votesHint = await takePendingVotesHint(sessionId);
+
+    // Merge: combine both pending hints if present, newline-separated.
+    const combined = [hint, votesHint].filter(Boolean).join('\n');
+    if (!combined) return null;
+
+    return JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: combined,
+      },
+    });
   },
 };
 
@@ -216,13 +253,15 @@ const votesSyncHandler: HookHandler = {
       // autoDetectInit picks project scope when present (so self-mode configs are
       // honored), falling back to user scope otherwise.
       const { localConfig } = await autoDetectInit();
-      const { VOTES_LOCAL_DIR, TEAMAI_SESSIONS_DIR } = await import('./types.js');
+      const { VOTES_LOCAL_DIR } = await import('./types.js');
       const votesDir = VOTES_LOCAL_DIR;
       const votePath = path.join(votesDir, `${localConfig.username}.yaml`);
 
-      // Record the adoptions the main conversation declared.
-      if (voteData.referencedDocIds.length > 0) {
-        await incrementUpvoted(votePath, voteData.referencedDocIds);
+      // Only count upvotes for docs actually recalled this session, to avoid crediting hallucinated/distractor doc-ids
+      const recalledSet = new Set(voteData.recalledDocIds);
+      const verifiedDocIds = voteData.referencedDocIds.filter((id) => recalledSet.has(id));
+      if (verifiedDocIds.length > 0) {
+        await incrementUpvoted(votePath, verifiedDocIds);
       }
       if (localConfig.repo.kind === 'self') {
         // Self mode: votes are report data → the teamai-reports orphan branch,
@@ -244,30 +283,24 @@ const votesSyncHandler: HookHandler = {
       }
 
       // Enforcement: recall happened but nothing was declared → nudge the model
-      // once to declare which recalled docs it actually used. The nudge makes the
+      // to declare which recalled docs it actually used. The nudge makes the
       // model continue; on the next Stop the declaration is recorded above.
+      // Most tools can retry until the model declares on the next turn. Cursor
+      // is capped below because followup_message itself forces another turn and
+      // would otherwise create an unbounded Stop loop.
       const sessionId = deriveSessionId(stdin, { includeCwd: true });
       const recalled = voteData.recalledDocIds;
       const declared = voteData.referencedDocIds;
       let nudged = false;
 
       if (recalled.length > 0 && declared.length === 0) {
-        const fsp = await import('node:fs/promises');
-        const safeId = sessionId.replace(/[^a-zA-Z0-9_.-]/g, '_');
-        const marker = path.join(TEAMAI_SESSIONS_DIR, `${safeId}-adoption-nudged`);
-        let already = false;
-        try { await fsp.access(marker); already = true; } catch { already = false; }
-        if (!already) {
-          try {
-            const { ensureDir } = await import('./utils/fs.js');
-            await ensureDir(TEAMAI_SESSIONS_DIR);
-            await fsp.writeFile(marker, '');
-            // Only nudge once we've persisted the marker, so a write failure
-            // degrades to "no nudge this Stop" rather than re-nudging every Stop.
-            nudged = true;
-          } catch {
-            // Could not persist the marker — skip the nudge this Stop; retry next.
-          }
+        nudged = true;
+        // Cursor's followup_message forces another model turn. Cap it to one
+        // per session so a model that never emits the declaration cannot enter
+        // an unbounded Stop → follow-up loop.
+        if ((tool ?? '').toLowerCase() === 'cursor') {
+          const { claimVotesNudge } = await import('./contribute-check.js');
+          nudged = await claimVotesNudge(sessionId);
         }
       }
 
@@ -292,9 +325,17 @@ const votesSyncHandler: HookHandler = {
 
       if (nudged) {
         const { formatStopHookOutput } = await import('./utils/hook-output.js');
+        const { STOP_STDOUT_UNSUPPORTED_TOOLS } = await import('./utils/tool-names.js');
         const msg =
           `你本次通过 teamai 召回了团队知识（候选 doc-id：${recalled.join(', ')}）。` +
           `结束前请在回复末尾声明你实际用到的条目：<!-- teamai:referenced-doc-ids: [用到的doc-id] -->；没用到就留空 []。`;
+        // For tools whose Stop stdout is ignored, stash the nudge for delivery
+        // on the next UserPromptSubmit (same cross-process mechanism as contribute).
+        if (STOP_STDOUT_UNSUPPORTED_TOOLS.has(tool ?? '')) {
+          const { stashVotesHint } = await import('./contribute-check.js');
+          await stashVotesHint(sessionId, msg);
+          return null;
+        }
         return formatStopHookOutput(msg, tool ?? 'claude');
       }
     } catch {
@@ -379,6 +420,7 @@ export function buildHandlerRegistry(): HandlerRegistration[] {
     { event: 'post-tool-use', matcher: '*', handler: localAgentHandler, timeoutMs: LOCAL_AGENT_TIMEOUT_MS, background: true },
 
     // ─── UserPromptSubmit ─────────────────────────────
+    { event: 'prompt-submit', matcher: '*', handler: pendingHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, gitOnly: true },
     { event: 'prompt-submit', matcher: '*', handler: trackSlashHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
     { event: 'prompt-submit', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
     { event: 'prompt-submit', matcher: '*', handler: localAgentHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },

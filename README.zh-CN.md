@@ -25,7 +25,7 @@ npm install -g teamai-cli
 
 ### 团队管理员 / 个人使用者
 
-在 Git 托管平台（GitHub、GitLab、CNB、TGit，或私有 Git 服务）创建共享经验仓库，**授予团队成员写权限**，然后运行 `teamai init https://github.com/yourorg/yourrepo`。
+在 Git 托管平台（GitHub、GitLab、GitCode、CNB、TGit，或私有 Git 服务）创建共享经验仓库，**授予团队成员写权限**，然后运行 `teamai init https://github.com/yourorg/yourrepo`。
 
 > **还没有团队仓库？** 可以从内置了成套 skills、rules、review agents 的模板起步。浏览 [teamai-hub](https://github.com/teamai-hub) org，点 **Use this template** 生成自己的仓库，再对它执行 `teamai init`。
 
@@ -75,7 +75,7 @@ teamai init https://github.com/yourorg/yourrepo --scope user
   </tbody>
 </table>
 
-**Git 托管平台** —— GitHub · GitLab · CNB · TGit · 私有 Git 服务。
+**Git 托管平台** —— GitHub · GitLab · GitCode · CNB · TGit · 私有 Git 服务。
 
 ### 分发策略
 
@@ -96,6 +96,7 @@ teamai init https://github.com/yourorg/yourrepo --scope user
 | **用量（Usage）** | `teamai digest` | 团队周报——token 用量、会话量、干预率。 |
 | **会话（Sessions）** | `teamai session save` | 脱敏的单会话摘要（工具序列、对话轮次、干预次数），喂给周报的 Session Highlights。 |
 | **看板（Dashboard）** | `teamai dashboard` | Web 看板，实时展示成员的编码会话状态、干预次数和 token 用量。 |
+| **知识库健康（KB Health）** | `teamai dashboard` → KB Health | 内置于看板的报告页面，展示知识库使用情况与健康状态——各类型覆盖率、高频召回条目、沉默条目、召回趋势、作者贡献及维护控制台。 |
 
 ## Harness 管理和分发
 
@@ -109,7 +110,7 @@ teamai push → 创建分支 + MR → reviewer 审批合并
            SessionStart hook → teamai pull → 同步到本地 AI 工具
 ```
 
-成员通过 `teamai push` 提交变更并创建合并请求供审核。合并后，`teamai pull`（由 SessionStart hook 在会话启动时自动触发）将最新资源同步到本地。Skills 会同步到 `~/.claude/skills/`、`~/.codex/skills/`、`~/.cursor/skills/`、`~/.codebuddy/skills/` 等目录。在 **project scope** 安装下，SessionStart 会先为当前工具创建项目根目录（例如 `<project>/.claude`），再 pull 写入；单独执行 `teamai pull` 仍不会凭空创建 Agent 目录。
+成员通过 `teamai push` 提交变更并创建合并请求供审核。若某个资源已在未合并的 PR 中等待评审，再次对它执行 `teamai push` 会就地更新该 PR，而非新开一个重复的 PR。合并后，`teamai pull`（由 SessionStart hook 在会话启动时自动触发）将最新资源同步到本地。Skills 会同步到 `~/.claude/skills/`、`~/.codex/skills/`、`~/.cursor/skills/`、`~/.codebuddy/skills/` 等目录。在 **project scope** 安装下，SessionStart 会先为当前工具创建项目根目录（例如 `<project>/.claude`），再 pull 写入；单独执行 `teamai pull` 仍不会凭空创建 Agent 目录。
 
 ### 团队 Hooks
 
@@ -215,6 +216,13 @@ teamai codebase --lint                      # 健康检查
 图谱存储组件、接口、配置和跨仓库依赖边。`teamai recall` 利用图谱进行增强排名。
 当召回命中 codebase 页面时，结果会附带一行 `Sources:`，列出相关源文件路径，供 agent 直接作为代码改动的入口，无需重新探索代码库。
 
+依赖边来自两条并行的提取轨道，重叠时以 AST 结果优先：
+
+- **AST 轨**（TypeScript/JavaScript、Python、Go）：使用 WASM 版 [tree-sitter](https://tree-sitter.github.io/) 解析器，将 `import`/`require`、调用点、以及 TS `implements` 子句解析为精确的文件到文件 `DEPENDS_ON` / `REFERENCES` / `IMPLEMENTS` 边（标记为 `code-ast`，带置信度权重）。
+- **启发式轨**（所有语言，含 Java/Rust）：基于正则的提取（标记为 `code-heuristic`），同时覆盖 AST 轨未支持的语言。
+
+WASM 解析器是纯 JavaScript 依赖，无需任何原生编译工具链。若因任何原因加载失败，提取会降级到启发式轨并记录一条 `AST_UNAVAILABLE` gap。设置 `TEAMAI_SKIP_AST=1` 可强制仅使用启发式提取。
+
 ## 命令一览
 
 | 命令 | 说明 |
@@ -226,6 +234,8 @@ teamai codebase --lint                      # 健康检查
 | `teamai contribute` | 将 session 经验分享到团队仓库 |
 | `teamai recall <query>` | 搜索团队知识库（BM25 + 图谱增强） |
 | `teamai recall enable/disable/status` | 开关或查看 recall 状态 |
+| `teamai recall promote [learningId]` | 将高置信度 learning 晋升为正式知识（skills/rules/docs） |
+| `teamai recall maintenance` | 维护知识库健康：清理低置信度 learnings、回写置信度、标记过时条目 |
 | `teamai import` | 导入知识（`--dir`、`--from-repo`、`--from-org`、`--from-repo-list`、`--from-mr`、`--from-iwiki`） |
 | `teamai codebase --lint` | 知识图谱健康检查 |
 | `teamai ci extract-mr --url <url>` | CI：从 MR 提取知识、发评论、合并后写入 |

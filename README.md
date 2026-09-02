@@ -25,7 +25,7 @@ npm install -g teamai-cli
 
 ### Team admin / solo user
 
-Create a shared-experience repo on your git host (GitHub, GitLab, CNB, TGit, or a private Git service), **grant write access to team members**, then run `teamai init https://github.com/yourorg/yourrepo`.
+Create a shared-experience repo on your git host (GitHub, GitLab, GitCode, CNB, TGit, or a private Git service), **grant write access to team members**, then run `teamai init https://github.com/yourorg/yourrepo`.
 
 > **No team repo yet?** Start from a template pre-loaded with production-ready skills, rules, and review agents. Browse the [teamai-hub](https://github.com/teamai-hub) org, click **Use this template**, then `teamai init` against your new repo.
 
@@ -75,7 +75,7 @@ Once initialized, every AI session automatically pulls the latest skills / rules
   </tbody>
 </table>
 
-**Git providers** — GitHub · GitLab · CNB · TGit · private Git service.
+**Git providers** — GitHub · GitLab · GitCode · CNB · TGit · private Git service.
 
 ### Distribution Controls
 
@@ -96,6 +96,7 @@ Insight into how the team actually uses its AI tools:
 | **Usage** | `teamai digest` | Weekly team digest — token usage, conversation volume, and intervention rate. |
 | **Sessions** | `teamai session save` | Privacy-scrubbed per-session summaries (tool sequence, prompt turns, interventions) that feed the digest's Session Highlights. |
 | **Dashboard** | `teamai dashboard` | Web dashboard showing team members' live coding-session status, intervention count, and token usage. |
+| **KB Health** | `teamai dashboard` → KB Health | Built-in dashboard page reporting knowledge-base usage & health — coverage by type, top recalled entries, silent entries, recall trend, author contributions, and a maintenance console. |
 
 ## Harness Management & Distribution
 
@@ -109,7 +110,7 @@ teamai push → create branch + MR → reviewer approves + merges
               SessionStart hook → teamai pull → synced to local AI tools
 ```
 
-Members push changes via `teamai push`, which opens a Merge Request for review. Once merged, `teamai pull` (triggered automatically on session start via the SessionStart hook) syncs the latest resources locally. Skills sync to `~/.claude/skills/`, `~/.codex/skills/`, `~/.cursor/skills/`, `~/.codebuddy/skills/`, etc. In a **project-scope** install, SessionStart first creates that tool's project root (e.g. `<project>/.claude`) if it is missing, then pulls into it — a bare `teamai pull` still will not invent agent directories.
+Members push changes via `teamai push`, which opens a Merge Request for review. Re-running `teamai push` on a resource that is still waiting in an unmerged PR updates that PR in place instead of opening a duplicate. Once merged, `teamai pull` (triggered automatically on session start via the SessionStart hook) syncs the latest resources locally. Skills sync to `~/.claude/skills/`, `~/.codex/skills/`, `~/.cursor/skills/`, `~/.codebuddy/skills/`, etc. In a **project-scope** install, SessionStart first creates that tool's project root (e.g. `<project>/.claude`) if it is missing, then pulls into it — a bare `teamai pull` still will not invent agent directories.
 
 ### Team Hooks
 
@@ -215,6 +216,13 @@ teamai codebase --lint                      # health check
 The graph stores components, interfaces, configs, and cross-repo import edges. `teamai recall` uses it for graph-boosted re-ranking.
 When a recall hit comes from a codebase page, the result includes a `Sources:` line listing the relevant source file paths — giving agents a direct starting point for code changes instead of re-exploring the repo.
 
+Edges come from two tracks that run together, with AST results taking precedence on overlap:
+
+- **AST track** (TypeScript/JavaScript, Python, Go): a WASM [tree-sitter](https://tree-sitter.github.io/) parser resolves `import`/`require`, call sites, and TS `implements` clauses to precise file-to-file `DEPENDS_ON` / `REFERENCES` / `IMPLEMENTS` edges (tagged `code-ast`, with confidence weights).
+- **Heuristic track** (all languages, including Java/Rust): regex-based extraction (tagged `code-heuristic`), which also covers languages the AST track does not.
+
+The WASM parser is a pure-JavaScript dependency — no native toolchain is required. If it fails to load for any reason, extraction falls back to the heuristic track and records an `AST_UNAVAILABLE` gap. Set `TEAMAI_SKIP_AST=1` to force heuristic-only extraction.
+
 ## Commands
 
 | Command | Description |
@@ -226,6 +234,8 @@ When a recall hit comes from a codebase page, the result includes a `Sources:` l
 | `teamai contribute` | Share session experience to team repo |
 | `teamai recall <query>` | Search the team knowledge base (BM25 + graph-boost) |
 | `teamai recall enable/disable/status` | Toggle or check recall state |
+| `teamai recall promote [learningId]` | Promote a high-confidence learning to formal knowledge (skills/rules/docs) |
+| `teamai recall maintenance` | Maintain knowledge base health: prune low-confidence learnings, writeback confidence scores, flag stale entries |
 | `teamai import` | Import knowledge (`--dir`, `--from-repo`, `--from-org`, `--from-repo-list`, `--from-mr`, `--from-iwiki`) |
 | `teamai codebase --lint` | Knowledge graph health check |
 | `teamai ci extract-mr --url <url>` | CI: extract knowledge from MR, post comments, write after merge |

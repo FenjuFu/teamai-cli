@@ -246,6 +246,48 @@ describe('uninstall', () => {
     expect(await fse.pathExists(teamaiHome)).toBe(false);
   });
 
+  // Regression: Cursor rules are `.mdc`; matching only `.md` left every team
+  // rule on disk after uninstall, still injected into each Cursor session.
+  it('removes cursor .mdc rules (and a legacy .md copy) on uninstall', async () => {
+    const { homeDir, repoPath, teamaiHome } = await setupFixture(tmpDir);
+    vi.stubEnv('HOME', homeDir);
+    vi.stubEnv('SHELL', '/bin/zsh');
+
+    const cursorRules = path.join(homeDir, '.cursor', 'rules');
+    await fse.ensureDir(cursorRules);
+    await fse.writeFile(path.join(cursorRules, 'team-rule.mdc'), '---\nalwaysApply: true\n---\n\n# Team Rule');
+    // Left behind by the layout that predates `.mdc`.
+    await fse.writeFile(path.join(cursorRules, 'team-rule.md'), '# Team Rule');
+    // A rule the user wrote themselves must survive.
+    await fse.writeFile(path.join(cursorRules, 'my-own-rule.mdc'), '---\nalwaysApply: true\n---\n\nmine');
+
+    const teamConfig = makeTeamConfig({
+      sharing: {
+        skills: {},
+        rules: { enforced: [] },
+        docs: { localDir: `${teamaiHome}/docs` },
+        env: { injectShellProfile: true },
+      },
+      toolPaths: {
+        claude: {
+          skills: '.claude/skills',
+          rules: '.claude/rules',
+          settings: '.claude/settings.json',
+          claudemd: '.claude/CLAUDE.md',
+          agents: '.claude/agents',
+        },
+        cursor: { skills: '.cursor/skills', rules: '.cursor/rules', settings: '.cursor/hooks.json' },
+      },
+    });
+    mockAutoDetectInit.mockResolvedValue({ localConfig: makeLocalConfig(homeDir, repoPath), teamConfig });
+
+    await uninstall({ force: true });
+
+    expect(await fse.pathExists(path.join(cursorRules, 'team-rule.mdc'))).toBe(false);
+    expect(await fse.pathExists(path.join(cursorRules, 'team-rule.md'))).toBe(false);
+    expect(await fse.pathExists(path.join(cursorRules, 'my-own-rule.mdc'))).toBe(true);
+  });
+
   // Regression: MCP cleanup used to run after ~/.teamai/ was deleted, so the
   // ownership manifest was already gone and removeAll became a no-op.
   it('卸载时移除 teamai 管理的 MCP server，并保留用户自建的', async () => {
@@ -636,6 +678,44 @@ describe('uninstall', () => {
     expect(await fse.pathExists(path.join(projectRoot, '.claude', 'skills', 'proj-skill'))).toBe(false);
     // Project .teamai/ removed
     expect(await fse.pathExists(teamaiHome)).toBe(false);
+  });
+
+  it('non-self project scope removes hooks from HOME, where #370 injects them (not <projectRoot>)', async () => {
+    const projectRoot = path.join(tmpDir, 'proj-hooks');
+    const repoPath = path.join(projectRoot, '.teamai', 'team-repo');
+    const homeDir = path.join(tmpDir, 'home');
+    await fse.ensureDir(repoPath);
+    await fse.ensureDir(path.join(projectRoot, '.teamai'));
+    await fse.writeFile(path.join(projectRoot, '.teamai', 'config.yaml'), 'scope: project');
+
+    // #370: a non-self project scope injects its hooks into HOME, not projectRoot.
+    await fse.ensureDir(path.join(homeDir, '.claude'));
+    await fse.writeJson(path.join(homeDir, '.claude', 'settings.json'), {
+      hooks: { SessionStart: [{ matcher: '*', hooks: [{ type: 'command', command: 'teamai hook-dispatch session-start' }], description: '[teamai] Auto-pull' }] },
+    });
+
+    vi.stubEnv('HOME', homeDir);
+    vi.stubEnv('SHELL', '/bin/bash');
+
+    const teamConfig = makeTeamConfig();
+    const localConfig = makeLocalConfig(projectRoot, repoPath, { scope: 'project', projectRoot });
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig });
+
+    await uninstall({ force: true });
+
+    // The reported bug (#1): uninstall scanned <projectRoot> and left the HOME
+    // SessionStart hook live forever. It must target the HOME settings file.
+    expect(mockReconcileHooks).toHaveBeenCalledWith(
+      path.join(homeDir, '.claude', 'settings.json'),
+      'claude',
+      [],
+      expect.objectContaining({ removeAll: true, manifestPath: expect.stringContaining('managed-hooks.json') }),
+    );
+    // …and never a <projectRoot> settings copy (there is none in this fixture).
+    const targetedProjectRoot = mockReconcileHooks.mock.calls.some(
+      (c) => String(c[0]).startsWith(path.join(projectRoot, '.claude')),
+    );
+    expect(targetedProjectRoot).toBe(false);
   });
 
   it('命名空间 skills 正确处理', async () => {

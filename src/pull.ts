@@ -3,11 +3,13 @@ import fse from 'fs-extra';
 import matter from 'gray-matter';
 import { requireInit, loadState, saveState, detectProjectConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from './config.js';
 import { pullRepo, getHeadRev } from './utils/git.js';
+import { flushPendingLearnings } from './utils/pending-learnings.js';
 import { log, spinner } from './utils/logger.js';
 import { pathExists, remove, listFiles, listDirs, readFileSafe } from './utils/fs.js';
 import { injectClaudeMdSection } from './utils/claudemd.js';
 import { getHandler, RulesHandler, DocsHandler, EnvHandler } from './resources/index.js';
 import { ResourceHandler } from './resources/base.js';
+import { ruleFileExtensionForTool } from './resources/rule-format.js';
 import { loadTagsConfig, filterByTags } from './utils/tags.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import type { GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, TagsConfig } from './types.js';
@@ -21,6 +23,7 @@ import {
   TEAMAI_RECALL_RULES_END,
   CultureFrontmatterSchema,
   resolveBaseDir,
+  resolveHookScope,
   getTeamaiHome,
   isRecallEnabled,
   isAgentDisabled,
@@ -87,6 +90,15 @@ async function refreshTeamRepo(
   }
 
   const result = await pullRepo(localConfig.repo.localPath);
+
+  // Retry any learnings whose push previously failed (see savePendingLearning).
+  // Best-effort: never let a flush error block the pull.
+  try {
+    await flushPendingLearnings(localConfig.repo.localPath, localConfig.username);
+  } catch (e) {
+    log.debug(`pending-learnings flush skipped: ${(e as Error).message}`);
+  }
+
   let version: string | null = null;
   try {
     version = await getHeadRev(localConfig.repo.localPath);
@@ -590,11 +602,20 @@ async function pullForScope(
         if (!await ResourceHandler.isToolInstalled(dir, baseDir)) continue;
         if (isAgentDisabled(localConfig, tool)) continue;
 
+        // Rules carry a per-tool extension (Cursor uses `.mdc`), and Cursor dirs
+        // may still hold a `.md` copy from the layout that predates it, so a
+        // tombstoned rule is cleaned up under every extension it may wear.
+        const extensions = type === 'rules'
+          ? [...new Set([ruleFileExtensionForTool(tool), '.md'])]
+          : [ext];
+
         for (const name of tombstones) {
-          const localPath = path.join(baseDir, dir, ext ? `${name}${ext}` : name);
-          if (await pathExists(localPath)) {
-            await remove(localPath);
-            log.debug(`[${scopeLabel}] Cleaned up tombstoned ${type} ${name} from ${dir}`);
+          for (const extension of extensions) {
+            const localPath = path.join(baseDir, dir, extension ? `${name}${extension}` : name);
+            if (await pathExists(localPath)) {
+              await remove(localPath);
+              log.debug(`[${scopeLabel}] Cleaned up tombstoned ${type} ${name} from ${dir}`);
+            }
           }
         }
       }
@@ -1188,7 +1209,11 @@ async function autoMigrateHooksIfNeeded(): Promise<void> {
   const { autoDetectInit } = await import('./config.js');
   const { injectHooksToAllTools } = await import('./hooks.js');
   const { localConfig, teamConfig } = await autoDetectInit();
-  const baseDir = resolveBaseDir(localConfig);
+  // Reinject where hooks actually live (resolveHookScope), not resolveBaseDir.
+  // The old-format check above reads HOME; for a non-self project scope
+  // resolveBaseDir → <projectRoot>, so reinjecting there never clears HOME's
+  // legacy format and this migration would re-fire on every pull (#370).
+  const { baseDir } = resolveHookScope(localConfig);
   const disabled = localConfig.disabledAgents;
   let hookFilter = localConfig.enabledAgents;
   if (disabled && disabled.length > 0) {
@@ -1278,6 +1303,12 @@ export async function pull(options: GlobalOptions): Promise<void> {
   // 3.6. Reconcile team MCP servers. Outside pullForScope for the same reason as
   // hooks. User-scope MCP remains isolated in project mode.
   await reconcileMcpAllScopes(activeUserConfig, projectConfig, options);
+
+  // 3.7. Reconcile the team co-author policy (does an AI tool stamp a
+  // Co-Authored-By / attribution trailer on its commits?). Outside pullForScope
+  // for the same reason as hooks/MCP; write-only, so it self-heals but never
+  // strips a trailer once the team drops the policy.
+  await reconcileCoAuthorAllScopes(activeUserConfig, projectConfig, options);
 
   // 4. Auto-report usage data to all active scopes. Events live in a single
   //    shared file (~/.teamai/usage.jsonl), so we report to each repo with
@@ -1404,6 +1435,46 @@ async function reconcileMcpAllScopes(
       }
     } catch (e) {
       log.debug(`[${localConfig.scope}] MCP reconcile skipped: ${(e as Error).message}`);
+    }
+  }
+}
+
+/**
+ * Reconcile the co-author policy across active scopes. Mirrors
+ * reconcileMcpAllScopes: loops the installed scopes, loads each team config,
+ * applies the resolved intent to every installed tool, and persists the
+ * per-file `coAuthorManaged` markers so the pass stays idempotent.
+ */
+async function reconcileCoAuthorAllScopes(
+  userConfig: LocalConfig | null,
+  projectConfig: LocalConfig | null,
+  options: GlobalOptions,
+): Promise<void> {
+  if (options.dryRun) return;
+  const scopes = [userConfig, projectConfig].filter((c): c is LocalConfig => !!c);
+  for (const localConfig of scopes) {
+    try {
+      const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
+      if (!teamConfig) continue;
+      const { reconcileCoAuthorForConfig } = await import('./coauthor-reconcile.js');
+      const state = await loadStateForScope(localConfig.scope, localConfig.projectRoot);
+      const { changes, managed } = await reconcileCoAuthorForConfig(teamConfig, localConfig, state);
+
+      const applied = changes.filter((c) => c.action !== 'skipped');
+      for (const c of changes) {
+        if (c.action === 'skipped') log.debug(`[coauthor] ${c.tool}: skipped — ${c.reason}`);
+      }
+      if (applied.length > 0) {
+        state.coAuthorManaged = managed;
+        await saveStateForScope(state, localConfig.scope, localConfig.projectRoot);
+        if (!options.silent) {
+          const verb = applied[0].enabled ? 'enabled' : 'disabled';
+          const tools = [...new Set(applied.map((c) => c.tool))];
+          log.info(`Co-author trailer ${verb} for ${tools.join(', ')}. Restart your AI tool session to apply.`);
+        }
+      }
+    } catch (e) {
+      log.debug(`[${localConfig.scope}] co-author reconcile skipped: ${(e as Error).message}`);
     }
   }
 }

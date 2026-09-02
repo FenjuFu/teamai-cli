@@ -67,6 +67,15 @@ export const SharingConfigSchema = z.object({
   recall: z.object({
     enabled: z.boolean().default(false),
   }).optional(),
+  // Optional (not .default) so existing TeamaiConfig literals stay valid, AND so
+  // "team has no opinion" (block absent) stays distinct from "team says off"
+  // (enabled: false). Only the former is a no-op; see resolveCoAuthor().
+  coAuthor: z.object({
+    /** Team default: whether members' AI-tool commits carry a Co-Authored-By /
+     *  attribution trailer. false = strip it (clean history). Users can override
+     *  per-machine via `coAuthorEnabled` in local config. */
+    enabled: z.boolean().default(true),
+  }).optional(),
   // Optional (not .default) so existing TeamaiConfig literals stay valid; use
   // getMcpSharing() for the defaulted view.
   mcp: z.object({
@@ -120,6 +129,21 @@ export function isRecallEnabled(
   return getRecallSharing(teamConfig).enabled;
 }
 
+/**
+ * Resolve the effective co-author intent: user override > team config > no-op.
+ *
+ * Returns `undefined` when neither the user nor the team has an opinion — the
+ * caller must then leave every tool's config untouched (write-only, never
+ * delete). A boolean means "make the trailer on/off"; only then do we write.
+ */
+export function resolveCoAuthor(
+  localConfig: { coAuthorEnabled?: boolean },
+  teamConfig: { sharing?: { coAuthor?: { enabled?: boolean } } },
+): boolean | undefined {
+  if (localConfig.coAuthorEnabled !== undefined) return localConfig.coAuthorEnabled;
+  return teamConfig.sharing?.coAuthor?.enabled;
+}
+
 // ─── Source config (cross-team subscription) ─────────
 //
 //  Data flow:
@@ -166,7 +190,7 @@ export const TeamaiConfigSchema = z.object({
   description: z.string().default(''),
   repo: z.string(),
   /** Git hosting provider. `git` is the transport-only fallback for arbitrary hosts. */
-  provider: z.enum(['tgit', 'github', 'cnb', 'gitlab', 'git']).default('tgit'),
+  provider: z.enum(['tgit', 'github', 'cnb', 'gitlab', 'gitcode', 'git']).default('tgit'),
   /**
    * @deprecated Ignored by `teamai init` (issue #250). Local install scope is
    * decided only by CLI `--scope` / default. Kept optional for old teamai.yaml files.
@@ -288,6 +312,10 @@ export const LocalConfigSchema = z.object({
   excludedSkills: z.array(z.string()).optional(),
   /** User-level override for recall feature. When set, takes precedence over team config. */
   recallEnabled: z.boolean().optional(),
+  /** Per-machine override for the co-author trailer in AI-tool commits. When set,
+   *  takes precedence over the team `sharing.coAuthor` default. Undefined means
+   *  "defer to the team" (see resolveCoAuthor). */
+  coAuthorEnabled: z.boolean().optional(),
   /** When set, only inject hooks into these agents. Additive across multiple init --agent runs. */
   enabledAgents: z.array(z.string()).optional(),
   /** Tools explicitly excluded from all teamai sync (set by `uninstall --agent`). Removed again by `init --agent`. */
@@ -298,6 +326,37 @@ export type LocalConfig = z.infer<typeof LocalConfigSchema>;
 export type LocalConfigInput = z.input<typeof LocalConfigSchema>;
 
 // ─── Local state (~/.teamai/state.json) ────────────────────
+
+/**
+ * A resource that was included in a still-open push PR.
+ * Matched against fresh scan results by `type` + `name`.
+ */
+export const PendingPushItemSchema = z.object({
+  type: z.string(),
+  name: z.string(),
+  /** Destination path inside the team repo, e.g. "skills/js/hello-skill". */
+  relativePath: z.string(),
+  /** Skill namespace chosen at push time, reapplied when the PR is updated. */
+  namespace: z.string().optional(),
+});
+
+/**
+ * A push branch that has been sent to the remote but whose PR is not merged yet.
+ *
+ * `teamai push` detects changes by diffing against the team repo's default
+ * branch, so resources sitting in an unmerged PR look "new" on every run and
+ * used to produce an endless stream of duplicate PRs. Recording them here lets
+ * push skip them by default and offer to update the existing PR instead.
+ */
+export const PendingPushSchema = z.object({
+  branch: z.string(),
+  prUrl: z.string().nullable().default(null),
+  createdAt: z.string(),
+  items: z.array(PendingPushItemSchema).default([]),
+});
+
+export type PendingPushItem = z.infer<typeof PendingPushItemSchema>;
+export type PendingPush = z.infer<typeof PendingPushSchema>;
 
 export const StateSchema = z.object({
   lastPush: z.string().nullable().default(null),
@@ -313,6 +372,18 @@ export const StateSchema = z.object({
   pushedRules: z.array(z.string()).default([]),
   pushedSkills: z.array(z.string()).default([]),
   pushedEnvVars: z.array(z.string()).default([]),
+  /** Push branches whose PR is still open — see PendingPushSchema. */
+  pendingPushes: z.array(PendingPushSchema).default([]),
+  /**
+   * Last co-author intent teamai actually wrote to tool configs, per tool file.
+   * Key = absolute config path, value = the boolean we last applied. Lets the
+   * reconciler stay idempotent (skip a no-op write) while honoring write-only
+   * semantics: we never remove a trailer field, we only stop touching it when
+   * neither user nor team has an opinion. Absent key = never managed by teamai.
+   * Optional (like lastPullTargets) so historical state.json and hand-built State
+   * literals stay valid; the reconciler treats absent as an empty map.
+   */
+  coAuthorManaged: z.record(z.string(), z.boolean()).optional(),
   lastUpdateCheck: z.string().nullable().default(null),
   availableUpdate: z.string().nullable().default(null),
 });
@@ -509,10 +580,9 @@ export const SKILL_NAME_REGEX = /^[a-zA-Z0-9_\-:.]{1,200}$/;
 export const TEAMAI_USAGE_PATH = `${TEAMAI_HOME}/usage.jsonl`;
 export const TEAMAI_KNOWN_SKILLS_PATH = `${TEAMAI_HOME}/known-skills.json`;
 export const TEAMAI_PUSHIGNORE_PATH = `${TEAMAI_HOME}/pushignore`;
-export const TEAMAI_SESSIONS_DIR = `${TEAMAI_HOME}/sessions`;
 /**
  * Local monthly session logs (`teamai session save`). Kept in a dedicated dir —
- * not TEAMAI_SESSIONS_DIR, which holds per-session contribute-state `.json`.
+ * not the sessions directory, which holds per-session contribute-state `.json`.
  */
 export const SESSION_LOGS_LOCAL_DIR = `${TEAMAI_HOME}/session-logs`;
 
@@ -823,6 +893,13 @@ export interface ContributeState {
   friction?: SessionFriction;
   /** Sanitized, single-line summary of the session's first task */
   promptSummary?: string;
+  /**
+   * A generated share-learnings hint awaiting delivery via UserPromptSubmit
+   * (used only for tools whose Stop hook ignores stdout — see
+   * STOP_STDOUT_UNSUPPORTED_TOOLS). Cleared once injected. Absent for tools
+   * that deliver the hint directly through the Stop hook.
+   */
+  pendingHint?: string;
 }
 
 /**
@@ -1034,9 +1111,22 @@ export type CultureFrontmatter = z.infer<typeof CultureFrontmatterSchema>;
 // ─── Scope helpers ─────────────────────────────────────
 
 /**
- * Resolve the base directory for resource installation based on scope.
- * - user scope  → the platform user home directory (e.g. /Users/xxx)
- * - project scope → localConfig.projectRoot (e.g. /Users/xxx/my-project)
+ * Resolve the base directory into which teamai installs AI-tool resources
+ * (skills/rules/agents, tool config files, CLAUDE.md, ...).
+ * - user scope    → the platform user home directory (e.g. /Users/xxx)
+ * - project scope → the project **workspace root** (localConfig.projectRoot)
+ *
+ * "workspace root" is the CURRENT git checkout (issue #374): for a git worktree,
+ * this is the worktree's own top level, NOT the main checkout, because every AI
+ * tool discovers project resources by scanning up from the launch directory to
+ * the current repository root. `detectProjectConfig` resolves projectRoot to that
+ * workspace root (subdirectory/worktree aware via `resolveAnchors`).
+ *
+ * This is deliberately separate from the per-project machine-data home: a later
+ * phase (P1) keys machine-local data by the shared `projectAnchor` (the main
+ * checkout) under `~/.teamai/projects/<slug>/`, while resources continue to land
+ * at the workspace root returned here. This function only ever governs resource
+ * landing, never machine-data location.
  */
 export function resolveBaseDir(localConfig: LocalConfig): string {
   if (localConfig.scope === 'project') {
@@ -1189,6 +1279,79 @@ export function getStatePath(scope: Scope, projectRoot?: string): string {
  */
 export function getManagedHooksPath(scope: Scope, projectRoot?: string): string {
   return path.join(getTeamaiHome(scope, projectRoot), 'managed-hooks.json');
+}
+
+/**
+ * Resolve where hooks are injected on disk for a config: the (baseDir,
+ * manifestPath) pair every hook injection path must share.
+ *
+ * The rule is load-bearing and was previously duplicated (and drifted) across
+ * `init`/`pull`/`bootstrap` (which used resolveBaseDir → projectRoot) and the
+ * `hooks inject` command (which used HOME, per #264). The divergence meant a
+ * project-scope `teamai init` tried to write the SessionStart hook into
+ * `<projectRoot>/.claude`, which does not exist yet on a fresh init, so the
+ * "only inject into installed tools" gate skipped every tool — leaving the
+ * project with no session-start hook and therefore no auto-pull.
+ *
+ * Canonical rule:
+ * - Non-self project scope → HOME + user manifest. `~/.claude` always exists,
+ *   so the gate passes; the dispatch runtime identifies the active project via
+ *   detectProjectConfig(stdin.cwd), so a projectRoot copy is unnecessary (#264).
+ * - Self single-repo mode → projectRoot (its resolveBaseDir). Hooks live in the
+ *   business repo's tool dirs and are committed to main so a teammate's clone
+ *   carries the session-start hook that self-heals ("clone = initialized").
+ * - User scope → HOME (its resolveBaseDir).
+ *
+ * Degrades gracefully: only self mode reaches the projectRoot branch, and a
+ * self config missing `projectRoot` (optional in the schema) falls back to HOME
+ * rather than throwing — so read-only callers like `doctor` never crash on a
+ * partially-broken config.
+ */
+export function resolveHookScope(
+  localConfig: LocalConfig,
+): { baseDir: string; manifestPath: string } {
+  const selfWithRoot = isSelfMode(localConfig) && !!localConfig.projectRoot;
+  if (localConfig.scope === 'project' && !selfWithRoot) {
+    return { baseDir: getUserHome(), manifestPath: getManagedHooksPath('user') };
+  }
+  return {
+    baseDir: resolveBaseDir(localConfig),
+    manifestPath: getManagedHooksPath(localConfig.scope, localConfig.projectRoot),
+  };
+}
+
+/**
+ * The legacy `<projectRoot>` hook location a pre-#370 CLI wrote to for a
+ * non-self project scope, whose hooks now live in HOME (`resolveHookScope`).
+ * Older `init`/`pull` runs wrote the SessionStart hook into
+ * `<projectRoot>/.claude` as well; left behind after upgrade it double-fires
+ * (two `hook-dispatch session-start` → two concurrent background pulls) and
+ * duplicates every team hook. Callers on the inject path (`init`/`pull`) and
+ * `hooks remove`/`uninstall` sweep it clean.
+ *
+ * Returns null when there is nothing project-owned to sweep:
+ * - user scope (only ever HOME),
+ * - project scope without a projectRoot,
+ * - self single-repo mode. Self mode's alternate location is HOME, which is
+ *   shared with any user-scope install and its user manifest — a blind
+ *   removeAll there would clobber genuine user-scope hooks, so we never sweep
+ *   it. (The cross-scope collision itself is tracked separately.)
+ * - projectRoot that IS the home dir (`teamai init .` run in `~`, e.g. a
+ *   dotfiles repo). Then the "legacy" location and the live HOME target are the
+ *   same file, and sweeping it would delete the hooks the primary pass just
+ *   wrote. This is what makes the "never returns HOME" invariant callers rely
+ *   on actually hold.
+ */
+export function resolveLegacyProjectHookScope(
+  localConfig: LocalConfig,
+): { baseDir: string; manifestPath: string } | null {
+  if (localConfig.scope !== 'project' || !localConfig.projectRoot) return null;
+  if (isSelfMode(localConfig)) return null;
+  if (path.resolve(localConfig.projectRoot) === path.resolve(getUserHome())) return null;
+  return {
+    baseDir: localConfig.projectRoot,
+    manifestPath: getManagedHooksPath('project', localConfig.projectRoot),
+  };
 }
 
 /**

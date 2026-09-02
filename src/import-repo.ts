@@ -15,6 +15,7 @@ import {
 } from './utils/repo-cache.js';
 import { touchCacheEntry } from './utils/cache-index.js';
 import { log } from './utils/logger.js';
+import { hasFrontmatter, stripFrontmatter } from './utils/frontmatter.js';
 
 // ─── Types ──────────────────────────────────────────────
 
@@ -225,7 +226,7 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
         oldSha = lastSync.sha;
         log.info(`[incremental] cache hit ${cacheDir}, syncing from ${oldSha.slice(0, 8)}`);
         try {
-            const fetchResult = await shallowFetch(cacheDir);
+            const fetchResult = await shallowFetch(cacheDir, { provider: providerName });
             cloneSha = fetchResult.sha;
             cloneBranch = 'HEAD';
             log.info(`[incremental] Fetch complete: SHA=${cloneSha.slice(0, 8)}`);
@@ -301,6 +302,9 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
         teamRepoDir = path.join(process.cwd(), '.teamai', 'team-repo');
     }
 
+    const { acquireImportLock } = await import('./utils/import-lock.js');
+    const releaseImportLock = await acquireImportLock(teamRepoDir);
+    try {
     // 4. Generate teamwiki/ knowledge graph artifacts + append AI narrative to overview.md
     const teamwikiRoot = output
         ? path.resolve(output, '..', 'teamwiki')
@@ -348,14 +352,14 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
                 if (codebaseMd) {
                     const overviewPath = path.join(evidenceDest, 'overview.md');
                     const existing = await fs.readFile(overviewPath, 'utf8').catch(() => '');
-                    const aiNarrative = codebaseMd.replace(/^---[\s\S]*?---\n*/m, '');
+                    const aiNarrative = stripFrontmatter(codebaseMd);
                     const marker = '## AI Architecture Narrative';
                     const oldMarker = '## AI 架构叙事';
                     let markerIdx = existing.indexOf(marker);
                     if (markerIdx < 0) markerIdx = existing.indexOf(oldMarker);
                     const base = markerIdx >= 0 ? existing.slice(0, markerIdx).trimEnd() : existing.trimEnd();
                     let combined: string;
-                    if (!base || !base.startsWith('---')) {
+                    if (!base || !hasFrontmatter(base)) {
                         combined = `---\ntitle: ${slug} overview\ndomain: code-knowledge\n---\n\n${marker}\n\n${aiNarrative}`;
                     } else {
                         combined = base + '\n\n---\n\n' + marker + '\n\n' + aiNarrative;
@@ -481,5 +485,8 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
         } catch (touchErr) {
             log.debug(`[cache-index] touchCacheEntry failed: ${String(touchErr)}`);
         }
+    }
+    } finally {
+        await releaseImportLock();
     }
 }

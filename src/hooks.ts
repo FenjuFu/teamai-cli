@@ -1,8 +1,10 @@
 import path from 'node:path';
+import { realpathSync } from 'node:fs';
 import { readJson, writeJson, expandHome, ensureDir, pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
-import { TEAMAI_HOOK_DESCRIPTION_PREFIX, TEAMAI_CUSTOM_HOOK_PREFIX, TEAMAI_AGENT_HOOK_PREFIX, getManagedHooksPath, resolveBaseDir } from './types.js';
+import { TEAMAI_HOOK_DESCRIPTION_PREFIX, TEAMAI_CUSTOM_HOOK_PREFIX, TEAMAI_AGENT_HOOK_PREFIX, resolveHookScope, resolveLegacyProjectHookScope } from './types.js';
 import type { HookDef, TeamaiConfig, LocalConfig } from './types.js';
+import { isSelfMode } from './types.js';
 import { builtinHookDefs, applyBuiltinOverride, ensureWrapperIfShellAvailable, SHELL_DEPENDENT_TOOLS } from './builtin-hooks.js';
 import type { BuiltinHookOverride } from './builtin-hooks.js';
 import { resolveTeamHooks } from './resources/hooks.js';
@@ -105,6 +107,35 @@ function detectFormat(tool: string): ToolFormat {
   return CURSOR_TOOLS.has(tool) ? 'cursor' : 'claude';
 }
 
+/**
+ * Tools that enforce a user trust gate on non-managed hooks. Only the public
+ * Codex (the OpenAI / ChatGPT Codex app, tool id `codex`) does: even after
+ * teamai writes `<repo>/.codex/hooks.json` or `~/.codex/hooks.json`, Codex may
+ * skip a newly added or changed hook until the user reviews/trusts it in
+ * `/hooks` or Settings → Hooks. The internal variants (`codex-internal`,
+ * `tcodex`) share the codex hooks.json *format* but not this trust gate, so
+ * they are intentionally excluded.
+ */
+const CODEX_TRUST_GATE_TOOLS = new Set(['codex']);
+
+/**
+ * True for a tool that gates hooks behind an explicit user trust step (only the
+ * public `codex`). teamai never edits Codex's `[hooks.state]` to auto-trust —
+ * the reminder is UX only. Exported so `hooks inject` / `doctor` can surface it.
+ */
+export function isCodexTrustGatedTool(tool: string): boolean {
+  return CODEX_TRUST_GATE_TOOLS.has(tool);
+}
+
+/**
+ * One-line reminder that Codex may require the user to trust newly written hooks
+ * before they run. Shared by `hooks inject` (post-write notice) and `doctor`
+ * (installed-hooks note) so the wording stays identical.
+ */
+export function codexTrustReminder(): string {
+  return 'Codex hooks written, but Codex may require you to review/trust them before they run — open /hooks or Settings → Hooks in Codex to trust them.';
+}
+
 /** Known teamai command substrings used to identify built-in / legacy hooks. */
 const TEAMAI_COMMAND_MARKERS = [
   'teamai pull', 'teamai update', 'teamai track', 'teamai dashboard', 'teamai contribute-check',
@@ -144,6 +175,8 @@ export interface ReconcileHooksOptions {
   manifestPath?: string;
   /** §4.8 team override of built-in hooks (disabled / timeout). */
   builtinOverride?: BuiltinHookOverride;
+  /** Project root used to gate non-self project-scope team hooks. */
+  teamHookProjectRoot?: string;
 }
 
 /** One injected team hook recorded in the manifest. */
@@ -163,9 +196,37 @@ async function readManifest(manifestPath: string): Promise<ManagedHooksManifest>
 }
 
 /** Team hooks to record in the manifest for a tool (empty when removing). */
-function manifestRecordsForTool(teamDefs: HookDef[], tool: string, removeAll: boolean): ManagedHookRecord[] {
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function canonicalProjectRoot(projectRoot: string): string {
+  try { return realpathSync.native(projectRoot); } catch { return path.resolve(projectRoot); }
+}
+
+/** Keep a project-scope team hook from firing in every project on the machine. */
+function gateTeamHookCommand(command: string, projectRoot?: string): string {
+  if (!projectRoot) return command;
+  const root = shellQuote(canonicalProjectRoot(projectRoot));
+  return `if [ "$PWD" = ${root} ] || case "$PWD" in ${root}/*) true;; *) false;; esac; then (${command}); fi`;
+}
+
+function isGatedForProject(command: string, projectRoot: string): boolean {
+  return command.startsWith(`if [ "$PWD" = ${shellQuote(canonicalProjectRoot(projectRoot))} ]`);
+}
+
+function isProjectGatedCommand(command: string): boolean {
+  return command.startsWith('if [ "$PWD" = ');
+}
+
+function scopedTeamDefs(teamDefs: HookDef[], projectRoot?: string): HookDef[] {
+  if (!projectRoot) return teamDefs;
+  return teamDefs.map((def) => ({ ...def, command: gateTeamHookCommand(def.command, projectRoot) }));
+}
+
+function manifestRecordsForTool(teamDefs: HookDef[], tool: string, removeAll: boolean, projectRoot?: string): ManagedHookRecord[] {
   if (removeAll) return [];
-  return teamDefsForTool(teamDefs, tool).map((d) => ({
+  return teamDefsForTool(scopedTeamDefs(teamDefs, projectRoot), tool).map((d) => ({
     id: d.key,
     event: d.event,
     ...(d.matcher && d.matcher !== '*' ? { matcher: d.matcher } : {}),
@@ -244,12 +305,24 @@ async function reconcileClaudeFormat(
   teamDefs: HookDef[],
   opts: ReconcileHooksOptions,
   teamActive: boolean,
+  desiredTeamCommands: Set<string>,
+  priorTeamCommands: Set<string>,
 ): Promise<void> {
   // Built-in management never removes team hooks; team hooks are reconciled only
   // when a team pass is active (manifest present). This keeps the builtin-only
   // refresh path (injectHooks / autoMigrate) non-destructive to team hooks (§5).
-  const isManaged = (e: HookMatcher): boolean =>
-    isBuiltinClaudeEntry(e) || (teamActive && isTeamClaudeEntry(e)) || (!!opts.removeAll && isAgentClaudeEntry(e));
+  const isManaged = (e: HookMatcher): boolean => {
+    if (isBuiltinClaudeEntry(e) || (!!opts.removeAll && isAgentClaudeEntry(e))) return true;
+    if (!teamActive || !isTeamClaudeEntry(e)) return false;
+    // Project-scope hooks share HOME with other projects. Only remove entries
+    // recorded for this project (or desired by this reconcile); otherwise a
+    // project B pull must not delete project A's hooks.
+    if (opts.teamHookProjectRoot) {
+      const command = e.hooks?.[0]?.command ?? '';
+      return desiredTeamCommands.has(command) || priorTeamCommands.has(command);
+    }
+    return true;
+  };
   const expanded = expandHome(settingsPath);
   await ensureDir(path.dirname(expanded));
   const settings: ClaudeSettingsJson = (await readJson<ClaudeSettingsJson>(expanded)) ?? {};
@@ -583,30 +656,45 @@ export async function reconcileHooks(
 ): Promise<void> {
   const teamActive = !!opts.manifestPath;
   const manifest = opts.manifestPath ? await readManifest(opts.manifestPath) : null;
-  const priorTeamCommands = new Set((manifest?.[tool] ?? []).map((r) => r.command));
+  const allPriorRecords = manifest?.[tool] ?? [];
+  const priorRecords = opts.teamHookProjectRoot
+    ? allPriorRecords.filter((r) => isGatedForProject(r.command, opts.teamHookProjectRoot!))
+    : allPriorRecords;
+  const priorTeamCommands = new Set(priorRecords.map((r) => r.command));
+  const scopedDefs = scopedTeamDefs(teamDefs, opts.teamHookProjectRoot);
+  const desiredTeamCommands = new Set(scopedDefs.filter((d) => !d.tools || d.tools.includes(tool)).map((d) => d.command));
 
   const format = detectFormat(tool);
   if (format === 'cursor') {
-    await reconcileCursorFormat(settingsPath, tool, teamDefs, opts, priorTeamCommands);
+    await reconcileCursorFormat(settingsPath, tool, scopedDefs, opts, priorTeamCommands);
   } else if (format === 'codex') {
-    await reconcileCodexFormat(settingsPath, tool, teamDefs, opts, priorTeamCommands);
+    await reconcileCodexFormat(settingsPath, tool, scopedDefs, opts, priorTeamCommands);
   } else {
-    await reconcileClaudeFormat(settingsPath, tool, teamDefs, opts, teamActive);
+    await reconcileClaudeFormat(settingsPath, tool, scopedDefs, {
+      ...opts,
+      // In a shared HOME settings file, only remove team entries belonging to
+      // this project. User-scope installs retain the historical marker sweep.
+      teamHookProjectRoot: opts.teamHookProjectRoot,
+    }, teamActive, desiredTeamCommands, priorTeamCommands);
   }
 
   // Update the manifest's team-hook index for this tool (when manifest is active).
   if (opts.manifestPath && manifest) {
-    const records = manifestRecordsForTool(teamDefs, tool, !!opts.removeAll);
+    const records = manifestRecordsForTool(teamDefs, tool, !!opts.removeAll, opts.teamHookProjectRoot);
     const prev = manifest[tool] ?? [];
-    const sameAsPrev = JSON.stringify(prev) === JSON.stringify(records);
+    const retained = opts.teamHookProjectRoot
+      ? prev.filter((r) => !isGatedForProject(r.command, opts.teamHookProjectRoot!))
+      : prev.filter((r) => isProjectGatedCommand(r.command));
+    const nextRecords = [...retained, ...records];
+    const sameAsPrev = JSON.stringify(prev) === JSON.stringify(nextRecords);
     const hadEntry = Object.prototype.hasOwnProperty.call(manifest, tool);
-    if (records.length === 0) {
+    if (nextRecords.length === 0) {
       if (hadEntry) {
         delete manifest[tool];
         await writeJson(expandHome(opts.manifestPath), manifest);
       }
     } else if (!sameAsPrev) {
-      manifest[tool] = records;
+      manifest[tool] = nextRecords;
       await writeJson(expandHome(opts.manifestPath), manifest);
     }
   }
@@ -732,7 +820,7 @@ export async function hasTeamaiHooks(
  * and gate on the `cwd` fed to `hook-dispatch`. Any project-scope copy left by
  * an earlier layout is deleted on the way through.
  */
-async function reconcileOpencodePlugin(baseDir: string, removeAll = false): Promise<void> {
+async function reconcileOpencodePlugin(baseDir: string, removeAll = false, installedBaseDir?: string): Promise<void> {
   const home = getUserHome();
   const { injectOpencodeHooks, removeOpencodeHooks } = await import('./opencode-hooks.js');
   if (path.resolve(baseDir) !== path.resolve(home)) {
@@ -742,7 +830,11 @@ async function reconcileOpencodePlugin(baseDir: string, removeAll = false): Prom
     await removeOpencodeHooks(home, 'user');
     return;
   }
-  if (await pathExists(path.join(home, '.config', 'opencode'))) {
+  const homeInstalled = await pathExists(path.join(home, '.config', 'opencode'));
+  const projectInstalled = installedBaseDir
+    ? await pathExists(path.join(installedBaseDir, '.opencode'))
+    : false;
+  if (homeInstalled || projectInstalled) {
     await injectOpencodeHooks(home, 'user');
   }
 }
@@ -778,14 +870,11 @@ export async function injectHooksToAllTools(toolPaths: Record<string, { settings
         log.warn(`Failed to inject hook into ${tool}: ${(e as Error).message}`);
       }
     } else if (OPENCLAW_TOOLS.has(tool)) {
-      const agentRoot = path.join(resolvedBaseDir, `.${tool}`);
-      if (await pathExists(agentRoot)) {
-        try {
-          const { injectOpenClawHooks } = await import('./openclaw-hooks.js');
-          await injectOpenClawHooks(path.join(agentRoot, 'hooks'), tool);
-        } catch (e) {
-          log.warn(`Failed to inject OpenClaw hook into ${tool}: ${(e as Error).message}`);
-        }
+      try {
+        const { injectOpenClawHooks } = await import('./openclaw-hooks.js');
+        await injectOpenClawHooks(undefined, tool);
+      } catch (e) {
+        log.warn(`Failed to inject OpenClaw hook into ${tool}: ${(e as Error).message}`);
       }
     } else if (tool === 'hermes') {
       try {
@@ -808,13 +897,20 @@ export async function injectHooksToAllTools(toolPaths: Record<string, { settings
  * Reconcile built-in (A) + team (B) hooks across every tool that has a settings
  * path, using a shared managed-hooks manifest. This is the authoritative
  * injection path used by `teamai pull` / `init` / `hooks inject`.
+ *
+ * `settingsOnly` restricts the pass to tools reconciled through their settings
+ * file, skipping Hermes and OpenCode. Those two go through global adapters that
+ * ignore `baseDir` — `removeHermesHooks()` takes none, and the OpenCode
+ * adapter's removeAll branch always targets HOME — so a caller sweeping a
+ * secondary location (the legacy `<projectRoot>` copy) must opt out, or it
+ * deletes the hooks the primary pass just installed.
  */
 export async function reconcileHooksToAllTools(
   toolPaths: Record<string, { settings?: string }>,
   baseDir: string,
   teamDefs: HookDef[],
   manifestPath: string,
-  opts: { removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[] } = {},
+  opts: { removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[]; settingsOnly?: boolean; installedBaseDir?: string; teamHookProjectRoot?: string } = {},
 ): Promise<void> {
   const activeTools = Object.keys(toolPaths).filter(t => !opts.filterAgents || opts.filterAgents.includes(t));
   let shellAvailable = true;
@@ -834,6 +930,7 @@ export async function reconcileHooksToAllTools(
     // JSON settings file, so it bypasses the settings-based reconcile path.
     // Install when the .hermes home exists; removeAll clears the teamai hook.
     if (tool === 'hermes') {
+      if (opts.settingsOnly) continue;
       try {
         const { getHermesHome } = await import('./hermes-home.js');
         const hermesRoot = getHermesHome();
@@ -853,8 +950,9 @@ export async function reconcileHooksToAllTools(
     // its config dirs. Route it to the plugin-file adapter instead of the
     // settings-based path.
     if (tool === 'opencode') {
+      if (opts.settingsOnly) continue;
       try {
-        await reconcileOpencodePlugin(baseDir, opts.removeAll);
+        await reconcileOpencodePlugin(baseDir, opts.removeAll, opts.installedBaseDir);
       } catch (e) {
         log.warn(`Failed to reconcile OpenCode hooks: ${(e as Error).message}`);
       }
@@ -867,16 +965,81 @@ export async function reconcileHooksToAllTools(
     // ensureDir — making uninstalled tools look installed and pulling skills
     // into them on later `pull`s.
     const toolRoot = path.join(baseDir, paths.settings.split('/')[0]);
-    if (!await pathExists(toolRoot)) continue;
+    const installedRoot = opts.installedBaseDir
+      ? path.join(opts.installedBaseDir, paths.settings.split('/')[0])
+      : toolRoot;
+    if (!await pathExists(toolRoot) && !await pathExists(installedRoot)) continue;
     const settingsPath = path.join(baseDir, paths.settings);
     try {
       await reconcileHooks(settingsPath, tool, teamDefs, {
         manifestPath,
         removeAll: opts.removeAll,
         builtinOverride: opts.builtinOverride,
+        teamHookProjectRoot: opts.teamHookProjectRoot,
       });
     } catch (e) {
       log.warn(`Failed to reconcile hooks for ${tool}: ${(e as Error).message}`);
+    }
+  }
+}
+
+/**
+ * True if a trust-gated Codex tool (the public `codex`) is both configured with
+ * a settings path and actually installed on disk under baseDir.
+ *
+ * "Installed" uses the same root-directory gate as reconcileHooksToAllTools, so
+ * a true result means inject just wrote hooks that Codex may require the user to
+ * trust. Internal variants (codex-internal / tcodex) are excluded — they share
+ * the format but not the trust gate. Used to decide whether to print the
+ * reminder after inject.
+ */
+export async function hasInstalledCodexTrustGatedTool(
+  toolPaths: Record<string, { settings?: string }>,
+  baseDir: string,
+): Promise<boolean> {
+  for (const [tool, paths] of Object.entries(toolPaths)) {
+    if (!isCodexTrustGatedTool(tool) || !paths.settings) continue;
+    const toolRoot = path.join(baseDir, paths.settings.split('/')[0]);
+    if (await pathExists(toolRoot)) return true;
+  }
+  return false;
+}
+
+/**
+ * Sweep the legacy `<projectRoot>` hook copy a pre-#370 CLI wrote alongside
+ * HOME for a non-self project scope. Without it both copies stay live after an
+ * upgrade and every session start fires hook-dispatch twice (two concurrent
+ * background pulls), and the auto-migrate guard never converges.
+ *
+ * Shared by the inject path (`init`/`pull`/`bootstrap`), `hooks inject`, and
+ * `hooks remove` so all three sweep identically. Two rules this encodes:
+ *
+ * - `settingsOnly` — Hermes and OpenCode reconcile through global adapters that
+ *   ignore `baseDir` (removeHermesHooks() takes none; the OpenCode adapter's
+ *   removeAll branch always targets HOME), so letting a secondary-location
+ *   sweep reach them deletes the hooks the primary pass just installed. The
+ *   project-scope OpenCode plugin is instead removed directly below, which is
+ *   the only OpenCode copy this legacy location can own.
+ * - No `filterAgents` — cleanup of a legacy location must be unconditional. A
+ *   tool disabled today may well be the one that wrote the stale copy back when
+ *   it was enabled; filtering it out would leave that copy firing forever.
+ */
+export async function sweepLegacyProjectHooks(
+  toolPaths: Record<string, { settings?: string }>,
+  localConfig: LocalConfig,
+): Promise<void> {
+  const legacy = resolveLegacyProjectHookScope(localConfig);
+  if (!legacy) return;
+  await reconcileHooksToAllTools(toolPaths, legacy.baseDir, [], legacy.manifestPath, {
+    removeAll: true,
+    settingsOnly: true,
+  });
+  if (toolPaths.opencode) {
+    try {
+      const { removeOpencodeHooks } = await import('./opencode-hooks.js');
+      await removeOpencodeHooks(legacy.baseDir, 'project');
+    } catch (e) {
+      log.warn(`Failed to remove legacy OpenCode project plugin: ${(e as Error).message}`);
     }
   }
 }
@@ -895,8 +1058,7 @@ export async function reconcileTeamHooksForConfig(
   const { defs: teamDefs, builtin } = opts.removeAll
     ? { defs: [] as HookDef[], builtin: undefined }
     : await resolveTeamHooks(teamConfig, localConfig.repo.localPath, { auto: opts.auto, silent: opts.silent });
-  const baseDir = resolveBaseDir(localConfig);
-  const manifestPath = getManagedHooksPath(localConfig.scope, localConfig.projectRoot);
+  const { baseDir, manifestPath } = resolveHookScope(localConfig);
   let filterAgents = opts.filterAgents ?? localConfig.enabledAgents;
   const disabled = localConfig.disabledAgents;
   if (disabled && disabled.length > 0) {
@@ -909,6 +1071,11 @@ export async function reconcileTeamHooksForConfig(
     removeAll: opts.removeAll,
     builtinOverride: builtin,
     filterAgents,
+    teamHookProjectRoot: localConfig.scope === 'project' && !isSelfMode(localConfig)
+      ? localConfig.projectRoot
+      : undefined,
+    installedBaseDir: localConfig.scope === 'project' ? (localConfig.projectRoot ?? baseDir) : undefined,
   });
+  await sweepLegacyProjectHooks(teamConfig.toolPaths, localConfig);
   return teamDefs;
 }

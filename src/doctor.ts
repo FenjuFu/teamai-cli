@@ -6,10 +6,11 @@ import type { GlobalOptions, Scope } from './types.js';
 import {
   TeamaiConfigSchema,
   TEAMAI_ENV_START,
-  resolveBaseDir,
+  resolveHookScope,
+  getTeamaiHome,
   type TeamaiConfig,
 } from './types.js';
-import { TEAMAI_HOOK_SUBCOMMANDS } from './hooks.js';
+import { TEAMAI_HOOK_SUBCOMMANDS, isCodexTrustGatedTool, codexTrustReminder } from './hooks.js';
 import { getUserHome } from './utils/home.js';
 
 interface Check {
@@ -47,6 +48,24 @@ async function buildHookChecks(toolPaths: TeamaiConfig['toolPaths'], baseDir: st
   return checks;
 }
 
+/**
+ * True if a trust-gated Codex tool (the public `codex`) already has teamai hooks
+ * installed on disk (settings file exists and contains the hook-dispatch
+ * command). Used to emit a lightweight reminder that Codex may still require the
+ * user to trust them. Read-only — never inspects or modifies Codex's
+ * [hooks.state] trust store. Internal variants are excluded (no trust gate).
+ */
+async function hasInstalledCodexHooks(toolPaths: TeamaiConfig['toolPaths'], baseDir: string): Promise<boolean> {
+  for (const [tool, paths] of Object.entries(toolPaths)) {
+    if (!isCodexTrustGatedTool(tool) || !paths.settings) continue;
+    const settingsPath = path.join(baseDir, paths.settings);
+    if (!await pathExists(settingsPath)) continue;
+    const content = await readFileSafe(settingsPath);
+    if (content?.includes('teamai hook-dispatch')) return true;
+  }
+  return false;
+}
+
 export async function doctor(options: GlobalOptions): Promise<void> {
   log.info('Running diagnostics...\n');
   const projectConfig = await detectProjectConfig();
@@ -66,7 +85,11 @@ export async function doctor(options: GlobalOptions): Promise<void> {
   // Fall back to schema defaults if team config is unavailable
   const toolPaths = teamConfig?.toolPaths ?? TeamaiConfigSchema.shape.toolPaths.parse(undefined);
   const providerName = teamConfig?.provider ?? 'tgit';
-  const baseDir = localConfig ? resolveBaseDir(localConfig) : getUserHome();
+  // Hook checks must look where hooks are actually injected. resolveHookScope
+  // maps a non-self project scope to HOME (#264), matching the injection path in
+  // init/pull/hooks-cmd — otherwise doctor checks <projectRoot>/.claude while the
+  // hooks live in ~/.claude and always reports them missing.
+  const baseDir = localConfig ? resolveHookScope(localConfig).baseDir : getUserHome();
 
   const checks: Check[] = [];
 
@@ -110,6 +133,15 @@ export async function doctor(options: GlobalOptions): Promise<void> {
       fix: 'Export GITLAB_TOKEN (a Personal Access Token with `api` scope). '
         + 'GITLAB_PRIVATE_TOKEN and GITLAB_PAT are accepted as aliases.',
     });
+  } else if (providerName === 'gitcode') {
+    // GitCode needs no CLI — only a Personal Access Token (env or ~/.netrc).
+    const { gitcodeIsAuthenticated } = await import('./providers/gitcode/index.js');
+    checks.push({
+      name: 'GitCode token is configured',
+      check: async () => gitcodeIsAuthenticated(),
+      fix: 'Export GITCODE_TOKEN (a GitCode Personal Access Token), or run `teamai init` '
+        + 'to paste one interactively. GC_TOKEN is accepted as an alias.',
+    });
   }
 
   checks.push(
@@ -147,7 +179,13 @@ export async function doctor(options: GlobalOptions): Promise<void> {
 
         const home = getUserHome();
 
-        const envShPath = path.join(home, '.teamai', 'env.sh');
+        // env.sh lives under teamaiHome, which is <projectRoot>/.teamai in
+        // project scope and ~/.teamai in user scope — mirror the path that
+        // `teamai pull` actually writes to, not a hardcoded user-home path.
+        const envShPath = path.join(
+          getTeamaiHome(localConfig.scope, localConfig.projectRoot),
+          'env.sh',
+        );
         if (!await pathExists(envShPath)) return false;
 
         const shell = process.env.SHELL ?? '';
@@ -172,6 +210,14 @@ export async function doctor(options: GlobalOptions): Promise<void> {
       if (fix) console.log(`    → ${fix}`);
       allPassed = false;
     }
+  }
+
+  // Codex trust-gate reminder: even when hooks are installed, Codex may not run
+  // them until the user reviews/trusts them. Note only — teamai never writes
+  // [hooks.state] to auto-trust.
+  if (await hasInstalledCodexHooks(toolPaths, baseDir)) {
+    console.log('');
+    log.info(codexTrustReminder());
   }
 
   console.log('');

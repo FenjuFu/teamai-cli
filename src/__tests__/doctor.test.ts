@@ -34,12 +34,14 @@ vi.mock('../providers/tgit/index.js', () => ({
 import { loadLocalConfig, loadTeamConfig } from '../config.js';
 import { pathExists, readFileSafe } from '../utils/fs.js';
 import { TEAMAI_HOOK_SUBCOMMANDS } from '../hooks.js';
+import { log } from '../utils/logger.js';
 import { doctor } from '../doctor.js';
 
 const mockedLoadLocalConfig = loadLocalConfig as Mock;
 const mockedLoadTeamConfig = loadTeamConfig as Mock;
 const mockedPathExists = pathExists as Mock;
 const mockedReadFileSafe = readFileSafe as Mock;
+const mockedLog = log as unknown as { info: Mock; success: Mock; warn: Mock; error: Mock; debug: Mock };
 
 const mockLocalConfig = {
     repo: { localPath: '/tmp/repo', remote: 'https://git.woa.com/team/repo.git' },
@@ -142,6 +144,52 @@ describe('doctor — hook checks', () => {
         expect(TEAMAI_HOOK_SUBCOMMANDS).toHaveLength(1);
     });
 
+    // Lock the resolveHookScope branch the doctor fix rides on (#264/#370): the
+    // hook check must look where hooks are actually injected, not at resolveBaseDir.
+    function hookCheckLine(): string | undefined {
+        return consoleSpy.mock.calls
+            .map((c) => c[0] as string)
+            .find((m) => typeof m === 'string' && m.includes('hooks in claude settings'));
+    }
+
+    it('non-self project scope resolves the hook check to HOME, not <projectRoot>', async () => {
+        const projectRoot = '/tmp/teamai-doctor-proj';
+        mockedLoadLocalConfig.mockResolvedValue({ ...mockLocalConfig, scope: 'project', projectRoot });
+        // HOME carries the hooks; <projectRoot> is empty. If doctor still used
+        // resolveBaseDir (→ projectRoot) this check would report ✖.
+        mockedReadFileSafe.mockImplementation(async (filePath: string) => {
+            if (filePath.includes('settings.json')) {
+                return filePath.includes(projectRoot) ? '{ "hooks": {} }' : buildFullHooksContent();
+            }
+            return null;
+        });
+
+        await doctor({});
+
+        expect(hookCheckLine()).toContain('✔');
+    });
+
+    it('self single-repo mode resolves the hook check to <projectRoot>, not HOME', async () => {
+        const projectRoot = '/tmp/teamai-doctor-self';
+        mockedLoadLocalConfig.mockResolvedValue({
+            ...mockLocalConfig,
+            scope: 'project',
+            projectRoot,
+            repo: { ...mockLocalConfig.repo, kind: 'self' },
+        });
+        // Only <projectRoot> carries the hooks (committed to the business repo).
+        mockedReadFileSafe.mockImplementation(async (filePath: string) => {
+            if (filePath.includes('settings.json')) {
+                return filePath.includes(projectRoot) ? buildFullHooksContent() : '{ "hooks": {} }';
+            }
+            return null;
+        });
+
+        await doctor({});
+
+        expect(hookCheckLine()).toContain('✔');
+    });
+
     it('should pass env check when env/env.yaml does not exist in team repo', async () => {
         mockedPathExists.mockImplementation(async (filePath: string) => {
             if (filePath.includes('env/env.yaml')) return false;
@@ -178,6 +226,37 @@ describe('doctor — hook checks', () => {
         const allCalls = consoleSpy.mock.calls.map((c) => c[0]);
         const envLine = allCalls.find((msg: string) => msg.includes('Env variables'));
         expect(envLine).toContain('✔');
+    });
+
+    it('notes Codex may require trust when Codex hooks are installed', async () => {
+        mockedLoadTeamConfig.mockResolvedValue({
+            ...mockTeamConfig,
+            toolPaths: {
+                claude: { settings: '.claude/settings.json', skills: '.claude/skills' },
+                codex: { settings: '.codex/hooks.json', skills: '.codex/skills' },
+            },
+        });
+        // Both settings files exist and contain the hook-dispatch command.
+        mockedReadFileSafe.mockImplementation(async (filePath: string) => {
+            if (filePath.includes('settings.json') || filePath.includes('hooks.json')) {
+                return buildFullHooksContent();
+            }
+            return null;
+        });
+
+        await doctor({});
+
+        const infoLines = mockedLog.info.mock.calls.map((c) => String(c[0]));
+        const note = infoLines.find((msg) => msg.includes('review/trust'));
+        expect(note).toBeDefined();
+        expect(note).toContain('Codex');
+    });
+
+    it('does not note Codex trust when no Codex hooks are installed', async () => {
+        // Default mockTeamConfig has only claude; readFileSafe returns full hooks.
+        await doctor({});
+        const infoLines = mockedLog.info.mock.calls.map((c) => String(c[0]));
+        expect(infoLines.some((msg) => msg.includes('review/trust'))).toBe(false);
     });
 
     it('should skip tools whose parent directory does not exist', async () => {
