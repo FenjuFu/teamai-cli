@@ -438,6 +438,11 @@ export class SkillsHandler extends ResourceHandler {
    */
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
     const baseDir = resolveBaseDir(localConfig);
+    // Tools present only via auto-discovery (installed on disk but not in the
+    // team's toolPaths) may hold personal skills. On first takeover we must not
+    // overwrite a pre-existing same-named skill there — only team-managed tools
+    // (scopedToolPaths) may overwrite.
+    const scopedKeys = new Set(Object.keys(scopedToolPaths(teamConfig, localConfig)));
 
     for (const [tool, toolPath] of Object.entries(await effectiveToolPaths(teamConfig, localConfig))) {
       if (isAgentDisabled(localConfig, tool)) continue;
@@ -459,6 +464,13 @@ export class SkillsHandler extends ResourceHandler {
           continue;
         }
         dest = path.join(baseDir, toolPath.skills, item.name);
+      }
+
+      // Auto-discovered (non-team-managed) tool with a pre-existing same-named
+      // skill: skip rather than clobber a personal skill on first takeover.
+      if (!scopedKeys.has(tool) && await pathExists(dest)) {
+        log.debug(`Skipping skill ${item.name} for auto-discovered ${tool}: destination exists (not overwriting personal skill)`);
+        continue;
       }
 
       try {

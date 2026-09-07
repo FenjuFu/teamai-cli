@@ -352,6 +352,73 @@ describe('pull role-aware sync and cleanup', () => {
     )).rejects.toThrow(/Duplicate skill "shared-skill"/);
   });
 
+  it('does not delete a personal skill in an auto-discovered dir during role cleanup (P1-1)', async () => {
+    // team config only manages claude; gemini is installed but NOT in toolPaths
+    await fse.ensureDir(path.join(homeDir, '.gemini', 'skills', 'pm-skill'));
+    await fse.writeFile(
+      path.join(homeDir, '.gemini', 'skills', 'pm-skill', 'SKILL.md'),
+      'PERSONAL PM NEVER SYNCED',
+    );
+
+    const teamConfig: TeamaiConfig = {
+      team: 'test',
+      description: '',
+      repo: 'https://git.woa.com/test/repo.git',
+      provider: 'tgit',
+      reviewers: [],
+      sharing: {
+        skills: {},
+        rules: { enforced: [] },
+        docs: { localDir: '' },
+        env: { injectShellProfile: true },
+      },
+      // Only claude is team-managed; gemini is installed but NOT listed here.
+      toolPaths: {
+        claude: { skills: '.claude/skills', rules: '.claude/rules' },
+      },
+    };
+    const localConfig: LocalConfig = {
+      repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+      primaryRole: 'hai',
+      additionalRoles: [],
+      resourceProfileVersion: 1,
+      scope: 'user',
+    };
+
+    await cleanupInactiveNamespaceSkills(
+      teamConfig,
+      localConfig,
+      new Set(['shared-skill', 'hai-skill']),
+      new Set(['pm-skill']),
+    );
+
+    // The personal skill in the auto-discovered (non-team-managed) dir survives.
+    expect(await fse.pathExists(path.join(homeDir, '.gemini/skills', 'pm-skill', 'SKILL.md'))).toBe(true);
+    expect(await fse.readFile(path.join(homeDir, '.gemini/skills', 'pm-skill', 'SKILL.md'), 'utf-8'))
+      .toBe('PERSONAL PM NEVER SYNCED');
+  });
+
+  it('does not overwrite a personal same-named skill in an auto-discovered dir on pull (P1-2)', async () => {
+    // team ships skills/hai/hai-skill; user has a personal ~/.gemini/skills/hai-skill
+    await fse.ensureDir(path.join(repoPath, 'skills', 'hai', 'hai-skill'));
+    await fse.writeFile(path.join(repoPath, 'skills', 'hai', 'hai-skill', 'SKILL.md'), 'TEAM CONTENT');
+    await fse.ensureDir(path.join(homeDir, '.gemini', 'skills', 'hai-skill'));
+    await fse.writeFile(
+      path.join(homeDir, '.gemini', 'skills', 'hai-skill', 'SKILL.md'),
+      'PERSONAL UNIQUE CONTENT',
+    );
+
+    await pull({});
+
+    // claude (team-managed) receives the team skill…
+    expect(await fse.pathExists(path.join(homeDir, '.claude/skills', 'hai-skill', 'SKILL.md'))).toBe(true);
+    // …but the personal skill in the auto-discovered gemini dir is NOT clobbered.
+    expect(await fse.readFile(path.join(homeDir, '.gemini/skills', 'hai-skill', 'SKILL.md'), 'utf-8'))
+      .toBe('PERSONAL UNIQUE CONTENT');
+  });
+
   it('cleans up stale skills after role change (full pull cycle)', async () => {
     // Setup: create skills in all namespaces
     await fse.ensureDir(path.join(repoPath, 'skills', 'common', 'shared-skill'));

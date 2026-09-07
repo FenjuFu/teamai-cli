@@ -226,7 +226,11 @@ export async function cleanupInactiveNamespaceSkills(
 ): Promise<void> {
   const baseDir = resolveBaseDir(localConfig);
 
-  for (const [tool, toolPath] of Object.entries(await effectiveToolPaths(teamConfig, localConfig))) {
+  // Role cleanup DELETES local skills, so it must only touch team-managed
+  // tools (scopedToolPaths), never auto-discovered dirs — a personal skill in
+  // e.g. ~/.gemini/skills that shares a name with an inactive-namespace team
+  // skill must not be deleted. Mirrors the tombstone/stale cleanup scoping.
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (isAgentDisabled(localConfig, tool)) continue;
     if (!toolPath.skills) continue;
     if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
