@@ -209,8 +209,13 @@ export class RulesHandler extends ResourceHandler {
             throw new Error(`Cannot read rule source ${item.sourcePath}`);
           }
           await writeFile(dest, teamRuleToCursorMdc(raw));
-          // Drop the `.md` copy left by an older layout; these tools do not read it.
-          await remove(path.join(destDir, `${item.name}.md`));
+          // Drop the `.md` copy left by an older layout; these tools do not read
+          // it. Only for team-managed tools: in an auto-discovered dir a same-named
+          // `.md` may be a personal file (no `.mdc` existed to gate the write), so
+          // never delete it there.
+          if (scopedKeys.has(tool)) {
+            await remove(path.join(destDir, `${item.name}.md`));
+          }
         } else {
           await copyFile(item.sourcePath, dest);
         }

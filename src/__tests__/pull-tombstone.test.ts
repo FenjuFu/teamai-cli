@@ -457,6 +457,22 @@ describe('pull role-aware sync and cleanup', () => {
       .toBe('PERSONAL RULE CONTENT');
   });
 
+  it('does not delete a personal .md when writing .mdc in an auto-discovered cursor dir (P1 cursor)', async () => {
+    // cursor is a .mdc tool, auto-discovered (not in toolPaths). A personal
+    // safety.md exists with NO safety.mdc — the old-layout .md cleanup must not
+    // delete it just because the .mdc write target was free.
+    await fse.ensureDir(path.join(homeDir, '.cursor', 'rules'));
+    await fse.writeFile(path.join(homeDir, '.cursor', 'rules', 'safety.md'), 'PERSONAL RULE CONTENT');
+    await fse.writeFile(path.join(repoPath, 'rules', 'safety.md'), 'TEAM RULE CONTENT');
+
+    await pull({ force: true });
+
+    // The personal .md in the auto-discovered cursor dir is preserved.
+    expect(await fse.pathExists(path.join(homeDir, '.cursor/rules', 'safety.md'))).toBe(true);
+    expect(await fse.readFile(path.join(homeDir, '.cursor/rules', 'safety.md'), 'utf-8'))
+      .toBe('PERSONAL RULE CONTENT');
+  });
+
   it('cleans up stale skills after role change (full pull cycle)', async () => {
     // Setup: create skills in all namespaces
     await fse.ensureDir(path.join(repoPath, 'skills', 'common', 'shared-skill'));
