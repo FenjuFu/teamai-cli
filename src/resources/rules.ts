@@ -5,6 +5,8 @@ import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileConten
 import { log } from '../utils/logger.js';
 import { TEAMAI_RULES_START, TEAMAI_RULES_END, resolveBaseDir, isAgentDisabled, scopedToolPaths, effectiveToolPaths } from '../types.js';
 import { EXCLUDED_RULE_NAMES } from '../builtin-rules.js';
+import { loadStateForScope, saveStateForScope } from '../config.js';
+import { ownershipKey, mayWriteAutoDiscovered, markAutoDiscovered } from './auto-discovered-ownership.js';
 import { teamRuleToCursorMdc, mergeCursorBodyIntoTeamMd, cursorMdcBodyEqualsTeamMd } from './cursor-mdc.js';
 import {
   ruleFileExtensionForTool,
@@ -165,6 +167,13 @@ export class RulesHandler extends ResourceHandler {
    */
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
     const baseDir = resolveBaseDir(localConfig);
+    // Auto-discovered tools may hold personal rules; teamai only overwrites a
+    // same-named rule there if it deployed that rule itself (tracked in
+    // state.autoDiscoveredManaged), otherwise it is preserved.
+    const scopedKeys = new Set(Object.keys(scopedToolPaths(teamConfig, localConfig)));
+    let state: Awaited<ReturnType<typeof loadStateForScope>> | null = null;
+    let stateDirty = false;
+
     for (const [tool, toolPath] of Object.entries(await effectiveToolPaths(teamConfig, localConfig))) {
       if (isAgentDisabled(localConfig, tool)) continue;
       if (!toolPath.rules) continue;
@@ -178,6 +187,19 @@ export class RulesHandler extends ResourceHandler {
       const destDir = path.join(baseDir, toolPath.rules);
       await ensureDir(destDir);
       const dest = path.join(destDir, `${item.name}${ruleFileExtensionForTool(tool)}`);
+
+      // Auto-discovered (non-team-managed) tool: only write if teamai deployed
+      // this rule before or nothing is there; a pre-existing untracked rule is
+      // personal — preserve it with a visible notice.
+      const key = ownershipKey(tool, 'rules', item.name);
+      if (!scopedKeys.has(tool)) {
+        if (state === null) state = await loadStateForScope(localConfig);
+        if (!await mayWriteAutoDiscovered(dest, key, state)) {
+          log.warn(`Preserving personal rule ${item.name} in ${tool} (${dest}): not deployed by teamai, not overwriting.`);
+          continue;
+        }
+      }
+
       try {
         if (usesCursorMdcRules(tool)) {
           // Cursor-compatible tools need `.mdc` with derived frontmatter.
@@ -193,9 +215,17 @@ export class RulesHandler extends ResourceHandler {
           await copyFile(item.sourcePath, dest);
         }
         log.debug(`Synced rule ${item.name} → ${tool}`);
+        if (!scopedKeys.has(tool) && state !== null) {
+          markAutoDiscovered(key, state);
+          stateDirty = true;
+        }
       } catch (e) {
         log.warn(`Failed to sync rule ${item.name} to ${tool}: ${(e as Error).message}`);
       }
+    }
+
+    if (stateDirty && state !== null) {
+      await saveStateForScope(state, localConfig);
     }
   }
 

@@ -7,6 +7,8 @@ import { listFiles, pathExists, copyFile, ensureDir, remove, fileContentEqual, g
 import { log } from '../utils/logger.js';
 import { resolveBaseDir, isAgentDisabled, isSelfMode, scopedToolPaths, effectiveToolPaths } from '../types.js';
 import { BUILTIN_AGENT_NAMES } from '../builtin-agents.js';
+import { loadStateForScope, saveStateForScope } from '../config.js';
+import { ownershipKey, mayWriteAutoDiscovered, markAutoDiscovered } from './auto-discovered-ownership.js';
 import {
   parseAgentYaml,
   serializeAgentYaml,
@@ -372,6 +374,11 @@ export class AgentsHandler extends ResourceHandler {
 
     const targets = spec.targets ?? ALL_SUPPORTED_TOOLS;
     const scoped = await effectiveToolPaths(teamConfig, localConfig);
+    // Auto-discovered tools may hold personal agents; teamai only overwrites a
+    // same-named agent there if it deployed that agent itself.
+    const scopedKeys = new Set(Object.keys(scopedToolPaths(teamConfig, localConfig)));
+    let state: Awaited<ReturnType<typeof loadStateForScope>> | null = null;
+    let stateDirty = false;
 
     for (const tool of targets) {
       const toolPath = scoped[tool];
@@ -390,11 +397,29 @@ export class AgentsHandler extends ResourceHandler {
         await ensureDir(destDir);
         const { ext, content: rendered } = renderForTool(spec, tool);
         const dest = path.join(destDir, `${item.name}${ext}`);
+
+        const key = ownershipKey(tool, 'agents', item.name);
+        if (!scopedKeys.has(tool)) {
+          if (state === null) state = await loadStateForScope(localConfig);
+          if (!await mayWriteAutoDiscovered(dest, key, state)) {
+            log.warn(`Preserving personal agent ${item.name} in ${tool} (${dest}): not deployed by teamai, not overwriting.`);
+            continue;
+          }
+        }
+
         await writeFile(dest, rendered);
         log.debug(`Rendered agent ${item.name} → ${tool} (${ext})`);
+        if (!scopedKeys.has(tool) && state !== null) {
+          markAutoDiscovered(key, state);
+          stateDirty = true;
+        }
       } catch (e) {
         log.warn(`Failed to sync agent ${item.name} to ${tool}: ${(e as Error).message}`);
       }
+    }
+
+    if (stateDirty && state !== null) {
+      await saveStateForScope(state, localConfig);
     }
   }
 
@@ -447,6 +472,11 @@ export class AgentsHandler extends ResourceHandler {
     localConfig: LocalConfig,
   ): Promise<void> {
     const legacyTools = new Set(['claude', 'claude-internal', 'tclaude', 'codebuddy', 'joycode']);
+    // Auto-discovered tools may hold personal agents; teamai only overwrites a
+    // same-named agent there if it deployed that agent itself.
+    const scopedKeys = new Set(Object.keys(scopedToolPaths(teamConfig, localConfig)));
+    let state: Awaited<ReturnType<typeof loadStateForScope>> | null = null;
+    let stateDirty = false;
 
     for (const [tool, toolPath] of Object.entries(await effectiveToolPaths(teamConfig, localConfig))) {
       if (!legacyTools.has(tool)) continue;
@@ -464,11 +494,29 @@ export class AgentsHandler extends ResourceHandler {
       try {
         await ensureDir(destDir);
         const dest = path.join(destDir, `${item.name}.md`);
+
+        const key = ownershipKey(tool, 'agents', item.name);
+        if (!scopedKeys.has(tool)) {
+          if (state === null) state = await loadStateForScope(localConfig);
+          if (!await mayWriteAutoDiscovered(dest, key, state)) {
+            log.warn(`Preserving personal agent ${item.name} in ${tool} (${dest}): not deployed by teamai, not overwriting.`);
+            continue;
+          }
+        }
+
         await copyFile(item.sourcePath, dest);
         log.debug(`Synced legacy agent ${item.name} → ${tool}`);
+        if (!scopedKeys.has(tool) && state !== null) {
+          markAutoDiscovered(key, state);
+          stateDirty = true;
+        }
       } catch (e) {
         log.warn(`Failed to sync legacy agent ${item.name} to ${tool}: ${(e as Error).message}`);
       }
+    }
+
+    if (stateDirty && state !== null) {
+      await saveStateForScope(state, localConfig);
     }
   }
 }

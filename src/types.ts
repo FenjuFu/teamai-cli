@@ -403,6 +403,15 @@ export const StateSchema = z.object({
    * literals stay valid; the reconciler treats absent as an empty map.
    */
   coAuthorManaged: z.record(z.string(), z.boolean()).optional(),
+  /**
+   * Resources teamai has deployed into AUTO-DISCOVERED tool dirs (installed on
+   * disk but not in the team's toolPaths). Keyed `<tool>:<resourceType>:<name>`.
+   * Lets pull tell a teamai deployment (safe to overwrite with team updates)
+   * from a personal same-named resource (preserve, never clobber). A key absent
+   * here + a pre-existing destination = personal resource. Optional so historical
+   * state.json and hand-built State literals stay valid (treated as empty).
+   */
+  autoDiscoveredManaged: z.array(z.string()).optional(),
   lastUpdateCheck: z.string().nullable().default(null),
   availableUpdate: z.string().nullable().default(null),
 });

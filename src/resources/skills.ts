@@ -11,6 +11,8 @@ import { getHermesHome } from '../hermes-home.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces } from '../roles.js';
 import { assertWithinRoot } from '../utils/path-safety.js';
 import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js';
+import { loadStateForScope, saveStateForScope } from '../config.js';
+import { ownershipKey, mayWriteAutoDiscovered, markAutoDiscovered } from './auto-discovered-ownership.js';
 
 /** File name used to track who has contributed (pushed) a skill. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
@@ -439,10 +441,13 @@ export class SkillsHandler extends ResourceHandler {
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
     const baseDir = resolveBaseDir(localConfig);
     // Tools present only via auto-discovery (installed on disk but not in the
-    // team's toolPaths) may hold personal skills. On first takeover we must not
-    // overwrite a pre-existing same-named skill there — only team-managed tools
-    // (scopedToolPaths) may overwrite.
+    // team's toolPaths) may hold personal skills. teamai only overwrites a
+    // pre-existing same-named skill there if it deployed that skill itself
+    // (tracked in state.autoDiscoveredManaged); otherwise it is preserved.
     const scopedKeys = new Set(Object.keys(scopedToolPaths(teamConfig, localConfig)));
+    // Lazily loaded/saved only when an auto-discovered tool is actually involved.
+    let state: Awaited<ReturnType<typeof loadStateForScope>> | null = null;
+    let stateDirty = false;
 
     for (const [tool, toolPath] of Object.entries(await effectiveToolPaths(teamConfig, localConfig))) {
       if (isAgentDisabled(localConfig, tool)) continue;
@@ -466,20 +471,33 @@ export class SkillsHandler extends ResourceHandler {
         dest = path.join(baseDir, toolPath.skills, item.name);
       }
 
-      // Auto-discovered (non-team-managed) tool with a pre-existing same-named
-      // skill: skip rather than clobber a personal skill on first takeover.
-      if (!scopedKeys.has(tool) && await pathExists(dest)) {
-        log.debug(`Skipping skill ${item.name} for auto-discovered ${tool}: destination exists (not overwriting personal skill)`);
-        continue;
+      // Auto-discovered (non-team-managed) tool: only write if teamai deployed
+      // this skill before (tracked) or nothing is there. A pre-existing untracked
+      // skill is personal — preserve it with a visible notice.
+      const key = ownershipKey(tool, 'skills', item.name);
+      if (!scopedKeys.has(tool)) {
+        if (state === null) state = await loadStateForScope(localConfig);
+        if (!await mayWriteAutoDiscovered(dest, key, state)) {
+          log.warn(`Preserving personal skill ${item.name} in ${tool} (${dest}): not deployed by teamai, not overwriting.`);
+          continue;
+        }
       }
 
       try {
         await copyDir(item.sourcePath, dest);
         await ensureSkillFrontmatter(dest, item.name);
         log.debug(`Synced skill ${item.name} → ${tool}`);
+        if (!scopedKeys.has(tool) && state !== null) {
+          markAutoDiscovered(key, state);
+          stateDirty = true;
+        }
       } catch (e) {
         log.warn(`Failed to sync skill ${item.name} to ${tool}: ${(e as Error).message}`);
       }
+    }
+
+    if (stateDirty && state !== null) {
+      await saveStateForScope(state, localConfig);
     }
   }
 

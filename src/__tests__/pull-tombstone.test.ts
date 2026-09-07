@@ -419,6 +419,44 @@ describe('pull role-aware sync and cleanup', () => {
       .toBe('PERSONAL UNIQUE CONTENT');
   });
 
+  it('still delivers team skill updates to an auto-discovered dir teamai deployed to (P2)', async () => {
+    // gemini installed (dir exists) but has NO pre-existing hai-skill.
+    await fse.ensureDir(path.join(homeDir, '.gemini', 'skills'));
+    await fse.ensureDir(path.join(repoPath, 'skills', 'hai', 'hai-skill'));
+    const v1 = '---\nname: hai-skill\ndescription: does a thing\n---\nTEAM CONTENT\n';
+    await fse.writeFile(path.join(repoPath, 'skills', 'hai', 'hai-skill', 'SKILL.md'), v1);
+
+    // First pull: teamai deploys the skill into the auto-discovered gemini dir
+    // and records ownership in state.
+    await pull({ force: true });
+    expect(await fse.readFile(path.join(homeDir, '.gemini/skills', 'hai-skill', 'SKILL.md'), 'utf-8'))
+      .toBe(v1);
+
+    // Team updates the skill body.
+    const v2 = '---\nname: hai-skill\ndescription: does a thing\n---\nTEAM VERSION TWO\n';
+    await fse.writeFile(path.join(repoPath, 'skills', 'hai', 'hai-skill', 'SKILL.md'), v2);
+
+    // Second pull: because teamai owns this deployment (tracked), the update
+    // reaches gemini — it is NOT mistaken for a personal skill.
+    await pull({ force: true });
+    expect(await fse.readFile(path.join(homeDir, '.gemini/skills', 'hai-skill', 'SKILL.md'), 'utf-8'))
+      .toBe(v2);
+  });
+
+  it('does not overwrite a personal same-named rule in an auto-discovered dir on pull (P1 rules)', async () => {
+    await fse.ensureDir(path.join(homeDir, '.gemini', 'rules'));
+    await fse.writeFile(path.join(homeDir, '.gemini', 'rules', 'safety.md'), 'PERSONAL RULE CONTENT');
+    await fse.writeFile(path.join(repoPath, 'rules', 'safety.md'), 'TEAM RULE CONTENT');
+
+    await pull({ force: true });
+
+    // claude (team-managed) receives the team rule…
+    expect(await fse.pathExists(path.join(homeDir, '.claude/rules', 'safety.md'))).toBe(true);
+    // …but the personal rule in the auto-discovered gemini dir is NOT clobbered.
+    expect(await fse.readFile(path.join(homeDir, '.gemini/rules', 'safety.md'), 'utf-8'))
+      .toBe('PERSONAL RULE CONTENT');
+  });
+
   it('cleans up stale skills after role change (full pull cycle)', async () => {
     // Setup: create skills in all namespaces
     await fse.ensureDir(path.join(repoPath, 'skills', 'common', 'shared-skill'));
