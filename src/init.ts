@@ -1,7 +1,7 @@
 import YAML from 'yaml';
 import fs from 'node:fs';
 import path from 'node:path';
-import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope } from './config.js';
+import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope, resolveProjectDataHome } from './config.js';
 import { reconcileTeamHooksForConfig } from './hooks.js';
 import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials } from './utils/git.js';
 import { pushRepoDirectly } from './utils/git.js';
@@ -274,7 +274,9 @@ export async function initHttp(
   if (fallbackReason) {
     log.warn(fallbackReason);
   }
-  const teamaiHome = getTeamaiHome(scope, projectRoot);
+  const teamaiHome = scope === 'project' && projectRoot
+    ? (existingLocalConfig?.dataHome ?? await resolveProjectDataHome(projectRoot))
+    : getTeamaiHome(scope, projectRoot);
   printScopeSummary(scope, projectRoot, explicit);
 
   if (scope === 'project' && !(await isInsideGitRepo(process.cwd()))) {
@@ -282,7 +284,7 @@ export async function initHttp(
   }
 
   // Re-init guard
-  const existingConfigPath = getConfigPath(scope, projectRoot);
+  const existingConfigPath = path.join(teamaiHome, 'config.yaml');
   if (await pathExists(existingConfigPath) && !options.force) {
     const confirmed = await askConfirmation(`teamai already initialized at ${existingConfigPath}. Overwrite? [y/N] `);
     if (!confirmed) {
@@ -325,6 +327,7 @@ export async function initHttp(
     scope,
     projectRoot,
     additionalRoles: [],
+    ...(scope === 'project' ? { dataHome: teamaiHome } : {}),
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
   };
   try {
@@ -356,9 +359,9 @@ export async function initHttp(
 
   // Invalidate cache so the next pull does a full sync.
   try {
-    const state = await loadStateForScope(scope, projectRoot);
+    const state = await loadStateForScope(localConfig);
     state.lastPullRev = null;
-    await saveStateForScope(state, scope, projectRoot);
+    await saveStateForScope(state, localConfig);
   } catch {
     // state may not exist yet
   }
@@ -394,6 +397,7 @@ export function buildSelfModeGitignore(): string {
     'config.yaml',
     'state.json',
     'token',
+    'teamai.lock',
     '.update-lock',
     '.reports-lock',
     '.bootstrap-lock',
@@ -425,13 +429,14 @@ export function buildSelfModeGitignore(): string {
 }
 
 /**
- * Migrate an existing single-repo `.teamai/.gitignore` written by an older teamai
- * (≤ beta.4), which ignored `env` — that hid `.teamai/env/env.yaml` from push and
- * kept it off main. Pure (no I/O) so it can be unit-tested.
+ * Migrate an existing single-repo `.teamai/.gitignore` written by an older teamai.
+ * Early versions ignored `env`, which hid `.teamai/env/env.yaml` from push and
+ * kept it off main; later versions also predate the machine-local package lock.
+ * Pure (no I/O) so it can be unit-tested.
  *
  * Removes a standalone `env` ignore line (NOT `env.sh` / `env.local` / `env/`, and
- * not commented lines), and ensures `env.local` is ignored (the machine-local
- * backup pull now writes). Returns whether anything changed plus the new content.
+ * not commented lines), and ensures `env.local` and `teamai.lock` are ignored.
+ * Returns whether anything changed plus the new content.
  */
 export function migrateSelfModeGitignoreContent(content: string): { changed: boolean; content: string } {
   const lines = content.split('\n');
@@ -461,6 +466,18 @@ export function migrateSelfModeGitignoreContent(content: string): { changed: boo
     changed = true;
   }
 
+  const hasPackageLock = filtered.some((l) => l.trim() === 'teamai.lock');
+  if (!hasPackageLock) {
+    const tokenIdx = filtered.findIndex((l) => l.trim() === 'token');
+    if (tokenIdx >= 0) {
+      filtered.splice(tokenIdx + 1, 0, 'teamai.lock');
+    } else {
+      const lastNonEmpty = filtered.reduce((acc, l, i) => (l.trim() ? i : acc), -1);
+      filtered.splice(lastNonEmpty + 1, 0, 'teamai.lock');
+    }
+    changed = true;
+  }
+
   return { changed, content: filtered.join('\n') };
 }
 
@@ -481,7 +498,7 @@ export async function migrateSelfModeGitignore(localConfig: LocalConfig): Promis
     if (!changed) return;
     await writeFile(gitignorePath, content);
     log.info(
-      'Updated .teamai/.gitignore so team env vars (.teamai/env/env.yaml) can be shared — '
+      'Updated .teamai/.gitignore for current machine-local files — '
       + 'please `git add .teamai/.gitignore` and commit it.',
     );
   } catch (e) {
@@ -744,6 +761,24 @@ export async function initSelfRepo(options: GlobalOptions & {
   await saveLocalConfigForScope(localConfig, 'project', businessRepoRoot);
   log.success(`Local config saved to ${teamaiHome}/config.yaml`);
 
+  // Retire any stale project partition from an earlier git-mode install: detection
+  // treats an existing partition as authoritative, so leaving it behind would make
+  // this self install unreachable (pull/push would keep hitting the old external
+  // repo). Removing the partition config is enough for detection to fall through to
+  // this self config; the rest of the old partition is left for the user to clean.
+  try {
+    const partition = await resolveProjectDataHome(businessRepoRoot);
+    if (partition !== teamaiHome) {
+      const partitionConfig = path.join(partition, 'config.yaml');
+      if (await pathExists(partitionConfig)) {
+        await remove(partitionConfig);
+        log.info(`Retired stale project partition config at ${partitionConfig}`);
+      }
+    }
+  } catch (e) {
+    log.debug(`partition retire skipped: ${(e as Error).message}`);
+  }
+
   const gitignorePath = path.join(teamaiHome, '.gitignore');
   await writeFile(gitignorePath, buildSelfModeGitignore());
   log.debug('Generated single-repo .teamai/.gitignore');
@@ -840,9 +875,9 @@ export async function initSelfRepo(options: GlobalOptions & {
 
   // Step 6.5: invalidate pull cache so next pull does a full sync.
   try {
-    const state = await loadStateForScope('project', businessRepoRoot);
+    const state = await loadStateForScope(localConfig);
     state.lastPullRev = null;
-    await saveStateForScope(state, 'project', businessRepoRoot);
+    await saveStateForScope(state, localConfig);
   } catch {
     // state may not exist yet
   }
@@ -919,7 +954,9 @@ export async function init(options: GlobalOptions & {
   if (fallbackReason) {
     log.warn(fallbackReason);
   }
-  const teamaiHome = getTeamaiHome(scope, projectRoot);
+  const teamaiHome = scope === 'project' && projectRoot
+    ? (existingLocalConfig?.dataHome ?? await resolveProjectDataHome(projectRoot))
+    : getTeamaiHome(scope, projectRoot);
   printScopeSummary(scope, projectRoot, explicit);
 
   if (scope === 'project' && !(await isInsideGitRepo(process.cwd()))) {
@@ -927,7 +964,7 @@ export async function init(options: GlobalOptions & {
   }
 
   // Step 0.5: Re-init guard — warn if config already exists
-  const existingConfigPath = getConfigPath(scope, projectRoot);
+  const existingConfigPath = path.join(teamaiHome, 'config.yaml');
   if (await pathExists(existingConfigPath)) {
     log.warn(`teamai is already initialized for ${scope} scope at ${existingConfigPath}`);
     if (options.force) {
@@ -1212,6 +1249,7 @@ export async function init(options: GlobalOptions & {
     scope,
     projectRoot,
     additionalRoles: [],
+    ...(scope === 'project' ? { dataHome: teamaiHome } : {}),
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
   };
 
@@ -1250,6 +1288,7 @@ export async function init(options: GlobalOptions & {
         'config.yaml',
         'state.json',
         'token',
+        'teamai.lock',
         '.update-lock',
         'env',
         'env.sh',
@@ -1274,9 +1313,9 @@ export async function init(options: GlobalOptions & {
   // Step 6.5: Invalidate pull cache so next pull does full sync with cleanup
   // This handles re-init scenarios where the user changes their role
   try {
-    const state = await loadStateForScope(scope, projectRoot);
+    const state = await loadStateForScope(localConfig);
     state.lastPullRev = null;
-    await saveStateForScope(state, scope, projectRoot);
+    await saveStateForScope(state, localConfig);
   } catch {
     // Non-critical: state file may not exist yet on first init
   }

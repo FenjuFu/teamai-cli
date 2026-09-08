@@ -2,14 +2,15 @@
 
 > [English](usage-guide.md) | [简体中文](usage-guide.zh-CN.md)
 
-> **@tencent/teamai-cli** — 团队 AI 经验共享框架
+> **@tencent/teamai-cli** — AI Agents 的团队协作层
 >
-> 帮助团队统一管理和共享 Skills、Rules、Docs、Env 等资源，自动同步到 Claude Code、CodeBuddy、Cursor、Codex、OpenCode、Gemini CLI、Windsurf 等 AI 编程工具中。
+> **让每个团队通过 AI 持续变得更聪明。** 统一工作方式（Team Execution）、共享团队 Context（Team Context），并把真实 Session 沉淀成团队能力（Team Improvement）。Skills、Rules、Docs、Env、MCP 等会自动同步到 Claude Code、CodeBuddy、Cursor、Codex、OpenCode、Gemini CLI、Windsurf 等工具。
 
 ---
 
 ## 目录
 
+- [TeamAI 是什么](#teamai-是什么)
 - [核心概念](#核心概念)
 - [安装](#安装)
 - [管理员初始化](#管理员初始化)
@@ -29,16 +30,36 @@
 
 ---
 
+## TeamAI 是什么
+
+Agent 作为个人工具已经很强，但学到的东西留在个人手里：昨天某位成员的 Agent 摸索出来的结论，今天到不了其他人的 Agent 面前。
+
+TeamAI 的产品是一条闭环，而不是三个独立产品：
+
+| 层 | 要解决的问题 | 在本 CLI 中怎么用 |
+|----|--------------|-------------------|
+| **Team Execution** | 让每个 Agent 按团队的方式工作 | `init` / `pull` / `push` 共享 Harness（skills、rules、agents、hooks、MCP、env） |
+| **Team Context** | 让每个 Agent 理解整个团队 | recall、docs、learnings、代码知识图谱 |
+| **Team Improvement** | 让每一次执行都成为团队能力的积累 | 基于摩擦信号的经验分享、sessions、digest |
+
+**Execute → Understand → Learn → Self-Improve。** 从 Harness 分发起步；Context 与 Improvement 随团队真实使用 Agent 而加深。
+
+---
+
 ## 核心概念
 
 | 概念 | 说明 |
 |------|------|
-| **Team Repo** | 一个 Git 仓库，集中存放团队共享的 Skills / Rules / Docs / Env 资源 |
+| **Team Repo** | 一个 Git 仓库，集中存放团队 Harness 与知识（Skills / Rules / Docs / Env / Packages，以及 learnings、wiki） |
 | **Scope** | 资源安装位置：`project`（当前项目，默认）或 `user`（用户主目录）|
+| **Team Execution** | 一份共享 Harness，分发到每位成员的 Agent |
+| **Team Context** | 可检索的团队知识，避免 Agent 每次 Session 从零理解团队 |
+| **Team Improvement** | 把 Session 摩擦与用量信号转化为新的 Skill、Rule 和知识 |
 | **Skills** | AI 可调用的自定义技能（目录形式，含 `SKILL.md`） |
 | **Rules** | Markdown 格式的团队规范，自动合并到 AI 工具配置中 |
 | **Docs** | 团队共享文档，供 AI 参考 |
 | **Env** | 团队共享环境变量，自动注入 shell |
+| **Packages** | 全团队统一的 npm 包和 Claude Code 插件，通过 `teamai packages` 主动安装 |
 
 ```
 ┌───────────────┐    teamai push (MR)    ┌───────────────────┐
@@ -181,7 +202,7 @@ teamai init . --agent claude,codex   # 非交互:启用 Claude Code + Codex
 
 **选择启用哪些 AI 工具。** 单仓模式会在你的仓库里为每个工具创建一个目录（如 `.claude/`、`.codex/`）—— 建好 skills 目录、注入 teamai hooks,并把该工具的 settings 提交到 main,让队友 clone 后即可获得。由你决定启用哪些工具:
 
-- **`--agent <name...>`** —— 显式列表,可重复或逗号分隔:`--agent claude`、`--agent claude,codex`、`--agent claude --agent cursor`。支持的 id:`claude`、`codex`、`cursor`、`codebuddy`、`workbuddy`、`dsh`(DeepSeek Harness)。
+- **`--agent <name...>`** —— 显式列表,可重复或逗号分隔:`--agent claude`、`--agent claude,codex`、`--agent claude --agent cursor`。支持的 id 包括 `claude`、`codex`、`cursor`、`joycode`、`codebuddy`、`workbuddy`、`dsh`（DeepSeek Harness）。
 - **交互式（无 `--agent`、有终端）** —— teamai 弹出多选列表。第 1 项是 **Auto**,会列出你本机已安装的 AI 工具（`~/.claude`、`~/.codex`……）并作为回车默认项;其余各项是具体工具。Auto 与具体工具可以组合勾选。
 - **非交互（无 `--agent`、无终端 —— CI、hook、clone 时自愈 bootstrap）** —— teamai 会按你本机 home 目录下已装的工具（`~/.claude`、`~/.codex`……）来建。若一个都没检测到,则什么都不建（你仍拿到知识,可稍后运行 `teamai init .` 再选工具）。
 
@@ -195,7 +216,7 @@ teamai init . --agent claude,codex   # 非交互:启用 Claude Code + Codex
 
 **克隆即初始化。** 由于知识资产和 `.teamai/teamai.yaml` 里的 `mode: self` 标记都提交在 main 上，团队成员 clone 仓库后会被自动初始化：下一条 `teamai` 命令或 AI 会话会识别该标记，并（在其 git provider 已认证的前提下）自动写入本机配置、注入 hooks、在孤儿分支上注册成员 —— 无需手抄 repo/role 参数。若尚未认证，teamai 会提示其运行一次 `teamai init .`。
 
-**安全性。** 单仓模式下 teamai 的每一次 git 写操作（知识 PR 和上报孤儿分支）都在 `.teamai/` 下的隔离 git worktree 中进行，绝不会 checkout、reset 或切换你的工作区和当前分支。
+**安全性。** 单仓模式下 teamai 的每一次 git 写操作（知识 PR 和上报孤儿分支）都在 `.teamai/` 下的隔离 git worktree 中进行，绝不会 checkout、reset 或切换你的工作区和当前分支。隔离 worktree 里的提交会跳过本地 git hook（例如 husky / lint-staged）：从 `origin/<default>` 检出的干净工作区往往只有 hook 脚本、没有本地生成的 `husky.sh`，而且知识/上报文件本来就不该跑业务仓的 lint。你在业务仓里的普通 `git commit` 仍会走 hook。
 
 **管理员在 `teamai init .` 之后的清单：**
 
@@ -291,6 +312,8 @@ teamai skill show hai-deploy-test   # 看单个 skill 的来源 / 贡献者 / �
 
 `teamai init` 时已注入 Hooks 到你的 AI 工具中。**每次启动 AI 会话时会自动执行 `teamai pull`**，无需手动操作。在 project scope 下，该 SessionStart hook 会先为当前 Agent 创建项目根目录（例如用 Claude Code 打开仓库时创建 `<project>/.claude`），然后再 pull。
 
+*(注：会话启动自动同步依赖工具的生命周期 Hooks 支持，如 Claude Code、Codex、Cursor、CodeBuddy、WorkBuddy、Qoder、OpenCode、Hermes、OpenClaw 等。对于暂无 Hooks 支持的工具（如 JoyCode、Gemini CLI 等），无法触发会话启动 Hook，需在终端手动执行 `teamai pull` 同步团队资源。)*
+
 如果需要立即同步，可以手动执行：
 
 ```bash
@@ -301,6 +324,75 @@ teamai pull --dry-run    # 试运行，不实际修改
 > Project scope 默认与 user scope 隔离。当前工作目录包含 project scope 的 `.teamai/config.yaml` 时，`pull` 会处理该项目并跳过 user scope；仅当本地配置包含 `inheritUserScope: true` 时，才会先刷新安全的 user 资源通道。当前目录没有 project 配置时，`pull` 处理 user scope。project 模式下，user 的 `env`、MCP 定义、sources、reporting 和写入行为仍保持隔离。hooks 是唯一例外：project scope 的 hooks 会注入到你的 **HOME** 工具设置（`~/.claude/settings.json` 等），而非 `<projectRoot>`——因为内置 hooks 依据传给 `hook-dispatch` 的 `cwd` 门控，且 `~/.claude` 恒存在、能通过「已安装工具」门槛（详见 Hooks 章节）。self 单仓模式则把 hooks 保留在业务仓库里，随 clone 传播。
 
 启用角色化 skills 后，`pull` 的 skills 同步来源会变成 `skills/<namespace>/` 中的内容，按 `primaryRole + additionalRoles` 展开对应的 namespace，拍平安装到本地各 AI 工具 skills 目录。`rules/`、`docs/`、`learnings/` 仍然保持原有全局同步逻辑。
+
+### 团队包
+
+`teamai packages` 通过现有团队仓库统一声明和恢复 npm 包与 Claude Code 插件。TeamAI 调用原生 `npm` 和 `claude plugin` CLI，不自行分发包内容。
+
+**管理员操作：**
+
+传入 target 时，命令会完成安装，并将声明写入团队仓库的 `teamai.yaml`：
+
+```bash
+# npm 包（默认安装为项目依赖）
+teamai packages install typescript
+
+# 未带 scope 的 name@version 与 plugin@marketplace 有歧义，需显式指定 npm
+teamai packages install typescript@5.9.2 --npm
+
+# 从指定 registry 安装全局 npm CLI
+teamai packages install eslint@latest --global \
+  --registry https://registry.npmjs.org/
+
+# Claude 插件
+teamai packages install code-review@claude-plugins-official
+
+# 通过现有评审流程分享更新后的 teamai.yaml
+teamai push
+```
+
+npm target 支持 `name` 或 `name@version`。由于未带 scope 的 `name@value` 也可能表示 `plugin@marketplace`，当后缀不是已声明或已注册的 Claude marketplace 时需使用 `--npm`。带 scope 的 npm 名称（`@scope/name`）、无版本名称、`--global` 和 `--registry` 已能明确表示 npm，不会探测 Claude CLI。安装项目依赖时，当前目录必须包含 `package.json`；机器级 CLI 工具使用 `--global`。`--registry` 会随该包的声明保存，且必须是不包含凭据的 HTTP(S) URL。registry 认证信息应保存在 npm 配置或环境变量中。
+
+Claude 插件 target 使用 `plugin@marketplace` 格式。`claude-plugins-official` 官方 marketplace 会自动解析；使用其他 marketplace 前，需先在 Claude Code 中注册，以便 TeamAI 获取并记录其来源。可使用 `--claude` 明确指定生态，并在 marketplace 不可用时获得针对性的错误。存在歧义的 target 会直接失败，不会运行任一包管理器。`--global` 和 `--registry` 仅适用于 npm target。
+
+**成员操作：**
+
+现有 SessionStart hook 会执行 `teamai pull`。当 `packages` 声明发生变化时，它只会提示成员检查 `teamai.yaml` 并主动安装，不会自动执行第三方包或插件代码。pull 继续在后台运行，避免网络延迟阻塞 IDE；如果声明在 SessionStart 输出窗口结束后才拉取完成，TeamAI 会把同一条提示安全地排队，并在本会话下一次 UserPromptSubmit 时投递。
+
+```bash
+teamai packages             # 安装团队声明的全部包和插件
+teamai packages --dry-run   # 预览底层命令，不安装也不写文件
+teamai doctor              # 检查运行环境及声明的包、marketplace、插件状态
+```
+
+安装成功后，TeamAI 会在当前 scope 的 `.teamai` 目录下写入本地快照 `teamai.lock`。该文件记录已安装版本，以及供 SessionStart 提示比对的声明哈希，不会写入团队仓库。在 user scope 下，全局 npm 工具和 Claude 插件只需确认一次；项目 npm 依赖会按工作目录分别确认，避免在一个仓库安装后错误关闭另一个仓库的提示。
+
+**声明格式：**
+
+以下内容由 `teamai packages install <target>` 自动维护：
+
+```yaml
+packages:
+  npm:
+    - name: typescript
+      version: "*"
+    - name: eslint
+      version: latest
+      global: true
+      registry: https://registry.npmjs.org/
+  claude:
+    marketplaces:
+      - name: claude-plugins-official
+        repo: anthropics/claude-plugins-official
+    plugins:
+      - name: code-review@claude-plugins-official
+```
+
+- `npm[].version` 默认为 `*`，`global` 默认为 `false`。
+- `claude.marketplaces` 记录 marketplace 名称与仓库来源。
+- Claude 插件必须使用 `plugin@marketplace` 格式，且对应 marketplace 必须已声明。
+- `packages` 内未知或拼错的键会在 install 或 push 前被拒绝。
+- 包声明对全团队生效，不受角色或项目筛选影响。
 
 ### 排除个人不需要的 Skill
 
@@ -403,6 +495,8 @@ teamai pull
 
 ## 共享团队资源
 
+这是 Team Execution：Skills、Rules 等 Harness 定义一次，经 MR 评审后由 `teamai pull` 分发到每个 Agent。
+
 ### Skills（技能）
 
 ```bash
@@ -502,9 +596,10 @@ servers:
 | cursor | `~/.cursor/mcp.json` | `<project>/.cursor/mcp.json` |
 | codebuddy / workbuddy | `~/.<tool>/mcp.json` | `<project>/.<tool>/mcp.json` |
 | codex | `~/.codex/config.toml` | 不支持 |
+| qoder | `~/.qoder/settings.json` | `<project>/.qoder/settings.json` |
 | opencode | `~/.config/opencode/opencode.json` | `<project>/opencode.json` |
 
-Codex 支持 `stdio` 与 `http`，`sse` 会被跳过。OpenCode 支持 `stdio`（写成其 `type:"local"` 形态）与 `http`（`type:"remote"`），`sse` 会被跳过，其 server 位于共享 `opencode.json` 的 `mcp` 键下。归属记录在 `~/.teamai/managed-mcp.json`——手动添加的 server 不动；与手写同名则跳过，除非 `--force`。
+Codex 支持 `stdio` 与 `http`，`sse` 会被跳过。Qoder 使用对应作用域 `.qoder/settings.json` 中与 Claude 兼容的 `mcpServers` 格式。OpenCode 支持 `stdio`（写成其 `type:"local"` 形态）与 `http`（`type:"remote"`），`sse` 会被跳过，其 server 位于共享 `opencode.json` 的 `mcp` 键下。归属记录在 `~/.teamai/managed-mcp.json`——手动添加的 server 不动；与手写同名则跳过，除非 `--force`。
 
 **密钥**：在 `mcp.yaml` 里写 `${VAR}`，不要写明文。取值优先来自环境变量，其次是 `env/env.yaml` → `~/.teamai/env`。变量无法解析则跳过并提示。
 
@@ -524,6 +619,8 @@ teamai mcp remove            # 移除所有 teamai 管理的 server
 ---
 
 ## 知识沉淀与检索
+
+这是 Team Context，也是 Team Improvement 的起点：先记下本次 Session 真正学到的东西，再让下一次 Agent 能检索到。
 
 ### 贡献知识
 
@@ -545,6 +642,18 @@ Consider running /teamai-share-learnings to summarize what you learned and share
 teamai contribute --file /tmp/session.md
 teamai contribute --file /tmp/session.md --scope project
 ```
+
+#### 关闭提醒
+
+如果团队通过自己的评审流程沉淀知识（例如个人复盘后提交普通 PR），可以只关闭这条提醒，Stop hook 的其余功能（更新检查、votes 同步、dashboard 上报）照常运行。配置方式与 recall 相同，分两层：
+
+| 层级 | 配置文件 | 字段 | 说明 |
+|------|----------|------|------|
+| 团队默认 | `teamai.yaml` | `sharing.contributeHint.enabled` | `true`（默认）/ `false` |
+| 用户覆盖 | `~/.teamai/config.yaml` | `contributeHintEnabled` | `true` / `false`，优先级高于团队默认 |
+| 环境变量 | shell | `TEAMAI_CONTRIBUTE_HINT_DISABLED=1` | 强制关闭提醒（紧急开关） |
+
+只影响提醒本身：摩擦评分、`teamai contribute --file` 和手动调用 `/teamai-share-learnings` 不受影响。
 
 ### 搜索知识
 
@@ -846,6 +955,40 @@ cat ~/.claude/CLAUDE.md
 }
 ```
 
+后端可下发 **`apply_model_config`** 任务，其 `cmd` 为 JSON。客户端同时兼容设计文档中的候选集结构和
+旧版单模型结构：`{"models":[...]}` 按完整快照处理，直接模型对象按增量 upsert 处理。
+`max_tokens` 可选（对应 CodeBuddy 的 `maxOutputTokens`）；缺省或 `0` 时默认 `4096`。Claude 不使用该字段。
+
+```jsonc
+{ "id": 16, "type": "apply_model_config",
+  "cmd": "{\"models\":[{\"provider\":\"openai\",\"model_id\":\"gpt-4o\",\"name\":\"GPT-4o\",\"base_url\":\"https://proxy.example.com/v1\",\"api_key\":\"<ProxyToken>\",\"max_tokens\":4096,\"context_window\":128000}]}" }
+```
+
+候选集只会写入当前上报任务的 agent。CodeBuddy 使用用户级 `~/.codebuddy/models.json`；若同一
+模型 ID 已由用户配置，则保留用户条目。Claude 侧会生成独立配置
+`~/.claude/teamai-models.json`；仅当 `~/.claude/settings.json` 中不存在冲突的用户 Anthropic
+网关配置时，才把网关环境变量写入默认 settings。不支持的 agent 会回执失败，不会误写其他
+agent 的配置。用户配置文件是符号链接时会保留链接。以上含凭证文件权限均为 `0600`。落盘成功后以
+`type: "apply_model_config"` 回执；
+非法 payload 回执 `failed`。未来未知任务类型会静默跳过，以保持协议向后兼容。
+
+反向的模型上报走已有的 `report` 接口：仅上报 TeamAI manifest 已记录、且磁盘上的模型 ID 和
+provider 仍可识别的模型，放在 `user_level.models` 中。agent 正常补充元数据不会导致漏报；
+模型落盘成功后会在同一次 sync 中立即补一次 report，无需等待下一次 session。用户自有模型不上报，
+因为后台无法识别。服务端要求 `provider` 与
+`model_id` 同时存在。与 skills/rules 一致，没有任何符合条件的模型时该字段整体省略——因为
+存在的数组会被当作全量快照。只有 CodeBuddy（`~/.codebuddy/models.json`）和 Claude
+（`~/.claude/settings.json` 里的 `ANTHROPIC_CUSTOM_MODEL_OPTION` 网关）有可发现的模型配置，
+其余工具不上报。上报条目的 `source` 固定为 `enterprise`。
+**`api_key` 不会被回传** —— ProxyToken 只留在本地磁盘。
+
+```jsonc
+{ "agent_type": "codebuddy", "local_agent_id": "...",
+  "user_level": { "models": [
+    { "provider": "tokenhub", "model_id": "gpt-4o", "name": "GPT-4o", "source": "enterprise" }
+  ] } }
+```
+
 后端也可下发 **`uninstall_teamai`** 命令来移除本地 agent。它携带一个 `cmd`（一条 `teamai` 子命令），让客户端执行一次，执行结果经同一 ack 通道回报：
 
 ```json
@@ -970,7 +1113,7 @@ teamai dashboard --port 8080
 |------|------|----------|
 | `interrupt` | 用户在 agent 执行中途按 ESC 打断 | transcript 中被中断的 turn |
 | `toolReject` | 用户拒绝某个工具调用（permission deny） | transcript 中标记拒绝的 tool_result |
-| `correction` | agent stop 后 60s 内用户追加含「不对 / 重来 / 错了 / wrong / redo」等纠偏词的 prompt | stop → prompt_submit 事件模式 |
+| `correction` | agent stop 后 60s 内用户追加含「不对 / 重来 / 错了 / wrong / redo / 違う / やり直し」等纠偏词（中、英、日）的 prompt | stop → prompt_submit 事件模式 |
 
 > 隐私：只统计**次数**，不落地任何 prompt 或 transcript 原文。
 
@@ -983,7 +1126,7 @@ teamai dashboard --port 8080
 | 徽标 | 含义 | 数据来源 |
 |------|------|----------|
 | `💬 N` | 该会话里**人类对话的轮数**（发了几次 prompt） | `UserPromptSubmit` 事件数 |
-| `⛁ X` | 该会话累计 **token 用量**（鼠标悬停看 输入 / 输出 / 缓存读 / 缓存写 明细） | Claude Code transcript 的 `message.usage`（按 `message.id` 去重，避免重复计数） |
+| `⛁ X` | 该会话累计 **token 用量**（鼠标悬停看 输入 / 输出 / 缓存读 / 缓存写 明细） | Claude Code `message.usage`、CodeBuddy `requests[].usage`，或 Codex 最新的会话级 `token_usage_record`；旧版 `event_msg.token_count` 按 rollout 文件各取最新快照后累加 |
 
 > 隐私：只统计**轮数与 token 数量**，不落地任何 prompt 或 transcript 原文。
 
@@ -1084,6 +1227,20 @@ team-repo/
 - **Rules** 会被复制到 `.opencode/rules/`（或 `~/.config/opencode/rules/`），但 OpenCode 不会自动扫描 rules 目录——文件在被引用前是惰性的。因此 teamai 会往 `opencode.json` 的 `instructions` 数组里加一条 `rules/*.md` glob，并在团队最后一条 rule 消失时再把它移除，且只编辑这一个键、不动你自己的 `instructions` 条目。
 - **Hooks** 以 OpenCode *plugin* 形式交付，而非配置文件条目——OpenCode 没有 `hooks` 数组，它会**同时**加载 `~/.config/opencode/plugin/` 和 `<project>/.opencode/plugin/` 下的 JS/TS 插件。两个目录都有插件时会被加载两次，每个事件也就派发两次，因此 teamai 只保留一份：写在用户目录的 `teamai-hooks.ts`，覆盖所有项目；早期布局残留的项目级副本会在下次同步时被删除。这与其他工具一致——它们的 `settings.json` hooks 同样放在 HOME，靠传给 `hook-dispatch` 的 `cwd` 做作用域判断。插件订阅 OpenCode 自己的事件，并 shell 到其他所有工具共用的 `teamai hook-dispatch` 入口。事件映射对齐 Claude 内置集合：`session.created` → session-start、`session.idle` → stop、`chat.message` → prompt-submit、`tool.execute.after` → post-tool-use。插件会转发与其他工具一致的 STDIN 负载（`cwd`、`tool_name`、`tool_input`、`prompt`），并把 OpenCode 的小写工具 id（`skill`、`todowrite`）映射回 handler 注册表期望的 PascalCase matcher。OpenCode 无法把 hook 的 stdout 回注到会话，因此 hooks 只为副作用运行（状态上报 / 同步 / 更新）。注意 OpenCode 会 **await** 它的具名 hook（`chat.message`、`tool.execute.after`），所以这两个事件的派发会短暂等待 `teamai` 子进程后 agent 才继续；错误始终被吞掉，hook 永远不会让会话失败。服务端下发的 agent hook（`teamai-agent-<slug>.ts`）同样装在这个用户级 plugin 目录下。
 - **MCP** server 位于共享 `opencode.json` 的 `mcp` 键下（详见上文 MCP 章节）。
+
+### Qoder
+
+Qoder 已作为内置目标支持。TeamAI 会将 Skills、Rules 和 Subagents 分别下发到 `.qoder/skills/`、`.qoder/rules/` 和 `.qoder/agents/`。Hooks 与 MCP Server 会合并进对应作用域的 `.qoder/settings.json`，并保留用户已有的其他设置；这些路径与 Qoder 的用户级和项目级配置约定一致。
+
+### JoyCode
+
+JoyCode 已作为内置目标支持。Skills、Rules 和 Subagents 分别下发到 `.joycode/skills/`、`.joycode/rules/` 和 `.joycode/agents/`。Rules 使用与 Cursor 兼容的 `.mdc` 格式，包括下文所述的派生 frontmatter 和仅正文往返同步；Subagents 使用带 YAML frontmatter 的 Markdown 文件。
+
+JoyCode 规则清理采用保守策略：不在团队规则列表中的本地 `.mdc` 和 `.md` 文件会被保留，只有团队明确记录了删除标记（tombstone）才会清理。这能保护同一目录中的个人规则；缺少删除记录的旧团队副本也会保留，不会猜测其已过期。
+
+对于以 YAML 保存的团队 Agent，push 会将本地文件与对应工具的渲染结果比较，只将真实编辑合并回原始配置。部署范围 `targets`、其他工具的元数据，以及本地格式未输出的字段都会保留。遇到冲突或无法解析的编辑时跳过回写，不会替换团队源文件。
+
+**Hooks 与手动同步**：JoyCode 当前没有提供生命周期 Hooks 机制或专用启动适配器（无类似 `settings.json` hooks 数组或 `hooks.json` 的事件配置）。因此，打开或启动 JoyCode 不会触发 TeamAI 的 `SessionStart` 事件，无法进行后台自动拉取（auto-pull）、使用指标上报（auto-report/track）或自动更新检测。JoyCode 用户需要通过在终端手动运行 `teamai pull` 来同步团队最新技能、规则与 Agent，通过 `teamai push` 贡献变更。若 JoyCode 后续版本提供了 Hooks 或插件生命周期机制，将通过专用适配器接入。
 
 ### Cursor
 
@@ -1197,6 +1354,11 @@ provider: tgit
 reviewers:
   - reviewer1
 
+packages:
+  npm:
+    - name: typescript
+      version: "*"
+
 sharing:
   rules:
     enforced: [code-review-guide]
@@ -1206,6 +1368,8 @@ sharing:
     injectShellProfile: true
   coAuthor:
     enabled: false             # 可选，为全团队去除 AI 工具提交尾注
+  contributeHint:
+    enabled: true              # 可选，false = 高摩擦 session 结束后不再提示 /teamai-share-learnings
 ```
 
 ### config.yaml（本地配置）
@@ -1220,6 +1384,7 @@ scope: project                 # project（init 默认）或 user
 projectRoot: /path/to/project  # 仅 project scope
 inheritUserScope: true         # 可选，仅 project scope，默认 false
 coAuthorEnabled: true          # 可选，每机器的 co-author 覆盖
+contributeHintEnabled: false   # 可选，每机器覆盖 sharing.contributeHint.enabled
 ```
 
 ---

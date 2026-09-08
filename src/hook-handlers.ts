@@ -85,6 +85,9 @@ const pullHandler: HookHandler = {
   name: 'pull',
   async execute(stdin, tool) {
     const cwd = resolveHookCwd(stdin);
+    const hintCwd = cwd ?? process.cwd();
+    const packageHints = await import('./pkg/pkg-hint.js');
+    const packageHashBeforePull = await packageHints.packageManifestHashForCwd(hintCwd);
     try {
       const { seedProjectAgentRoot } = await import('./project-agent-root.js');
       await seedProjectAgentRoot(tool, cwd);
@@ -93,6 +96,11 @@ const pullHandler: HookHandler = {
     }
     const { pull } = await import('./pull.js');
     await pull({ silent: true });
+    await packageHints.stashPackageHintAfterPull(
+      hintCwd,
+      deriveSessionId(stdin, { includeCwd: true }),
+      packageHashBeforePull,
+    );
     return null;
   },
 };
@@ -182,9 +190,28 @@ const trackSlashHandler: HookHandler = {
   },
 };
 
+/**
+ * Whether the share-learnings hint may be emitted at all. Resolved lazily per
+ * hook run so a team can switch it off via teamai.yaml (or a member via local
+ * config) without re-injecting hooks. Falls back to enabled when config can't
+ * be read, preserving pre-toggle behavior for half-initialized installs.
+ */
+async function contributeHintAllowed(): Promise<boolean> {
+  const { isContributeHintEnabled } = await import('./types.js');
+  try {
+    const { autoDetectInit } = await import('./config.js');
+    const { localConfig, teamConfig } = await autoDetectInit();
+    return isContributeHintEnabled(localConfig, teamConfig);
+  } catch {
+    return isContributeHintEnabled({}, {});
+  }
+}
+
 const contributeCheckHandler: HookHandler = {
   name: 'contribute-check',
   async execute(stdin, tool) {
+    if (!(await contributeHintAllowed())) return null;
+
     const { contributeCheckForSession } = await import('./contribute-check.js');
     const { formatStopHookOutput } = await import('./utils/hook-output.js');
     const { STOP_STDOUT_UNSUPPORTED_TOOLS } = await import('./utils/tool-names.js');
@@ -204,14 +231,13 @@ const contributeCheckHandler: HookHandler = {
   },
 };
 
-/** UserPromptSubmit: deliver a hint stashed at Stop for stdout-less tools. */
+/** UserPromptSubmit: deliver contribution hints stashed by stdout-less tools. */
 const pendingHintHandler: HookHandler = {
   name: 'pending-hint',
   async execute(stdin, tool) {
     const { STOP_STDOUT_UNSUPPORTED_TOOLS } = await import('./utils/tool-names.js');
     if (!STOP_STDOUT_UNSUPPORTED_TOOLS.has(tool)) return null;
 
-    const { takePendingHint, takePendingVotesHint } = await import('./contribute-check.js');
     // Must match contributeCheckHandler's derivation so Stop and UserPromptSubmit
     // resolve to the same session file. This cross-process handoff relies on
     // codebuddy/workbuddy sending a stable, consistent session_id on BOTH the
@@ -220,10 +246,13 @@ const pendingHintHandler: HookHandler = {
     // tool omits session_id, deriveSessionId falls back to pid+cwd, which can
     // differ across the two hook processes and orphan the stash (best-effort).
     const sessionId = deriveSessionId(stdin, { includeCwd: true });
-    const hint = await takePendingHint(sessionId);
-    const votesHint = await takePendingVotesHint(sessionId);
+    const pending = await import('./contribute-check.js');
+    // Always consume the stash so a hint stashed before the team turned the
+    // feature off is not delivered later when it is turned back on.
+    const stashed = await pending.takePendingHint(sessionId);
+    const hint = (await contributeHintAllowed()) ? stashed : null;
+    const votesHint = await pending.takePendingVotesHint(sessionId);
 
-    // Merge: combine both pending hints if present, newline-separated.
     const combined = [hint, votesHint].filter(Boolean).join('\n');
     if (!combined) return null;
 
@@ -231,6 +260,24 @@ const pendingHintHandler: HookHandler = {
       hookSpecificOutput: {
         hookEventName: 'UserPromptSubmit',
         additionalContext: combined,
+      },
+    });
+  },
+};
+
+/** UserPromptSubmit: deliver a package notice created by the detached pull. */
+const packagePendingHintHandler: HookHandler = {
+  name: 'package-pending-hint',
+  async execute(stdin, _tool) {
+    const { takePendingPackageHint } = await import('./pkg/pkg-hint.js');
+    const hint = await takePendingPackageHint(
+      deriveSessionId(stdin, { includeCwd: true }),
+    );
+    if (!hint) return null;
+    return JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: hint,
       },
     });
   },
@@ -374,6 +421,17 @@ const mrHintHandler: HookHandler = {
   },
 };
 
+const packageHintHandler: HookHandler = {
+  name: 'package-hint',
+  async execute(stdin, _tool) {
+    const { claimPackageHintOutput } = await import('./pkg/pkg-hint.js');
+    return claimPackageHintOutput(
+      resolveHookCwd(stdin) ?? process.cwd(),
+      deriveSessionId(stdin, { includeCwd: true }),
+    );
+  },
+};
+
 /** HTTP local-agent report/sync + workspace binding prompts. */
 const localAgentHandler: HookHandler = {
   name: 'local-agent-sync',
@@ -398,6 +456,7 @@ export function buildHandlerRegistry(): HandlerRegistration[] {
     { event: 'session-start', matcher: '*', handler: pullHandler, timeoutMs: LOCAL_AGENT_TIMEOUT_MS, background: true },
     { event: 'session-start', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
     { event: 'session-start', matcher: '*', handler: mrHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, gitOnly: true },
+    { event: 'session-start', matcher: '*', handler: packageHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
     { event: 'session-start', matcher: '*', handler: localAgentHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
 
     // ─── Stop ─────────────────────────────────────────
@@ -421,6 +480,7 @@ export function buildHandlerRegistry(): HandlerRegistration[] {
 
     // ─── UserPromptSubmit ─────────────────────────────
     { event: 'prompt-submit', matcher: '*', handler: pendingHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, gitOnly: true },
+    { event: 'prompt-submit', matcher: '*', handler: packagePendingHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
     { event: 'prompt-submit', matcher: '*', handler: trackSlashHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
     { event: 'prompt-submit', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },
     { event: 'prompt-submit', matcher: '*', handler: localAgentHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS },

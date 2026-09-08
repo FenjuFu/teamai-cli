@@ -2,6 +2,7 @@ import { createRequire } from 'node:module';
 import { Command, Option } from 'commander';
 import { setVerbose, setSilent, log } from './utils/logger.js';
 import type { GlobalOptions } from './types.js';
+import { registerPackagesCommand } from './pkg/register-command.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -10,7 +11,7 @@ const program = new Command();
 
 program
   .name('teamai')
-  .description('TeamAI — The team harness for AI agents')
+  .description('TeamAI — Make Every Team AI Native')
   .version(version)
   .option('--dry-run', 'Preview mode, no changes made')
   .option('-v, --verbose', 'Verbose output')
@@ -178,6 +179,8 @@ program
     const { remove } = await import('./remove.js');
     await remove(type, names, globalOpts);
   });
+
+registerPackagesCommand(program);
 
 program
   .command('doctor')
@@ -933,11 +936,16 @@ recallCmd
   .option('--update-quality', 'Find stale docs/rules/skills and suggest updates')
   .option('--dry-run', 'Show what would be done without making changes')
   .action(async (cmdOpts) => {
-    const { requireInit } = await import('./config.js');
-    const { localConfig } = await requireInit();
-    const repoPath = localConfig.repo.localPath;
-    const votesDir = `${repoPath}/votes`;
-    const learningsDir = `${repoPath}/learnings`;
+    if (!cmdOpts.confidenceWriteback && !cmdOpts.prune && !cmdOpts.updateQuality) {
+      const { log } = await import('./utils/logger.js');
+      log.info('Usage: teamai recall maintenance --prune | --confidence-writeback | --update-quality');
+      return;
+    }
+
+    const { autoDetectInit } = await import('./config.js');
+    const { localConfig } = await autoDetectInit();
+    const { resolveMaintenancePaths } = await import('./maintenance/index.js');
+    const { repoPath, votesDir, learningsDir } = await resolveMaintenancePaths(localConfig);
 
     if (cmdOpts.confidenceWriteback) {
       const { computeAllConfidence, writeBackConfidence } = await import('./maintenance/index.js');
@@ -994,9 +1002,6 @@ recallCmd
       log.info('\nReview drafts, then rename .draft.md -> .md to apply updates.');
       return;
     }
-
-    const { log } = await import('./utils/logger.js');
-    log.info('Usage: teamai recall maintenance --prune | --confidence-writeback | --update-quality');
   });
 
 recallCmd
@@ -1005,12 +1010,14 @@ recallCmd
   .option('--category <cat>', 'Target category: skills | rules | docs')
   .option('--dry-run', 'Show what would be done without making changes')
   .action(async (learningId, cmdOpts) => {
-    const { requireInit } = await import('./config.js');
-    const { localConfig } = await requireInit();
-    const repoPath = localConfig.repo.localPath;
-    const votesDir = `${repoPath}/votes`;
-    const learningsDir = `${repoPath}/learnings`;
-    const { findPromotionCandidates, executePromotion } = await import('./maintenance/index.js');
+    const { autoDetectInit } = await import('./config.js');
+    const { localConfig } = await autoDetectInit();
+    const {
+      resolveMaintenancePaths,
+      findPromotionCandidates,
+      executePromotion,
+    } = await import('./maintenance/index.js');
+    const { repoPath, votesDir, learningsDir } = await resolveMaintenancePaths(localConfig);
     const { log } = await import('./utils/logger.js');
 
     const candidates = await findPromotionCandidates(learningsDir, votesDir);

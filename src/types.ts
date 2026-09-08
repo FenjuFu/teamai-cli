@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { getUserHome } from './utils/home.js';
 
 // ─── Tool path config ───────────────────────────────────
@@ -67,6 +68,16 @@ export const SharingConfigSchema = z.object({
   recall: z.object({
     enabled: z.boolean().default(false),
   }).optional(),
+  // Optional (not .default) so existing TeamaiConfig literals stay valid; use
+  // isContributeHintEnabled() for the resolved view.
+  contributeHint: z.object({
+    /** Team default: whether the Stop hook nudges members to run
+     *  /teamai-share-learnings after a high-friction session. Teams that route
+     *  knowledge sharing through their own review flow can turn the nudge off
+     *  without disabling the rest of the Stop hook (update check, votes sync,
+     *  dashboard reporting). */
+    enabled: z.boolean().default(true),
+  }).optional(),
   // Optional (not .default) so existing TeamaiConfig literals stay valid, AND so
   // "team has no opinion" (block absent) stays distinct from "team says off"
   // (enabled: false). Only the former is a no-op; see resolveCoAuthor().
@@ -127,6 +138,20 @@ export function isRecallEnabled(
 ): boolean {
   if (localConfig.recallEnabled !== undefined) return localConfig.recallEnabled;
   return getRecallSharing(teamConfig).enabled;
+}
+
+/**
+ * Resolve whether the share-learnings hint is enabled: env kill switch >
+ * user override > team config > default (true).
+ */
+export function isContributeHintEnabled(
+  localConfig: { contributeHintEnabled?: boolean },
+  teamConfig: { sharing?: { contributeHint?: { enabled?: boolean } } },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (env.TEAMAI_CONTRIBUTE_HINT_DISABLED === '1') return false;
+  if (localConfig.contributeHintEnabled !== undefined) return localConfig.contributeHintEnabled;
+  return teamConfig.sharing?.contributeHint?.enabled ?? true;
 }
 
 /**
@@ -230,6 +255,20 @@ export const TeamaiConfigSchema = z.object({
     tclaude: { skills: '.tclaude/skills', rules: '.tclaude/rules', settings: '.tclaude/settings.json', claudemd: '.tclaude/CLAUDE.md', agents: '.tclaude/agents', mcp: '.tclaude/.claude.json' },
     tcodex: { skills: '.tcodex/skills', rules: '.tcodex/rules', settings: '.tcodex/hooks.json', agents: '.tcodex/agents' },
     cursor: { skills: '.cursor/skills', rules: '.cursor/rules', settings: '.cursor/hooks.json', agents: '.cursor/agents', mcp: '.cursor/mcp.json', mcpProject: '.cursor/mcp.json' },
+    // JoyCode: skills, rules (.mdc), and subagents are synced to .joycode/.
+    // JoyCode currently does not provide a lifecycle hooks system or startup
+    // adapter, so it intentionally has no `settings` path. Hook reconciliation
+    // skips JoyCode cleanly without generating ghost files; users must sync
+    // manually via `teamai pull`.
+    joycode: { skills: '.joycode/skills', rules: '.joycode/rules', agents: '.joycode/agents' },
+    qoder: {
+      skills: '.qoder/skills',
+      rules: '.qoder/rules',
+      settings: '.qoder/settings.json',
+      agents: '.qoder/agents',
+      mcp: '.qoder/settings.json',
+      mcpProject: '.qoder/settings.json',
+    },
     codebuddy: { skills: '.codebuddy/skills', rules: '.codebuddy/rules', settings: '.codebuddy/settings.json', claudemd: '.codebuddy/CODEBUDDY.md', agents: '.codebuddy/agents', mcp: '.codebuddy/mcp.json', mcpProject: '.codebuddy/mcp.json' },
     openclaw: { skills: '.openclaw/skills', rules: '.openclaw/rules', claudemd: '.openclaw/workspace/AGENTS.md' },
     hermes: { skills: '.hermes/skills', claudemd: 'AGENTS.md' },
@@ -312,6 +351,8 @@ export const LocalConfigSchema = z.object({
   excludedSkills: z.array(z.string()).optional(),
   /** User-level override for recall feature. When set, takes precedence over team config. */
   recallEnabled: z.boolean().optional(),
+  /** User-level override for the share-learnings hint. When set, takes precedence over team config. */
+  contributeHintEnabled: z.boolean().optional(),
   /** Per-machine override for the co-author trailer in AI-tool commits. When set,
    *  takes precedence over the team `sharing.coAuthor` default. Undefined means
    *  "defer to the team" (see resolveCoAuthor). */
@@ -322,7 +363,22 @@ export const LocalConfigSchema = z.object({
   disabledAgents: z.array(z.string()).optional(),
 });
 
-export type LocalConfig = z.infer<typeof LocalConfigSchema>;
+/**
+ * In-memory config: the persisted schema plus a runtime-only `dataHome`.
+ *
+ * `dataHome` is the resolved machine-data home (`~/.teamai/projects/<slug>/` in
+ * the P1 partition layout), attached in memory by `detectProjectConfig`/init
+ * when the git anchor is resolvable, and consumed by `getDataHome`. It is
+ * deliberately NOT part of `LocalConfigSchema`, so:
+ *  - on LOAD, Zod strips it from disk (default object parsing drops unknown
+ *    keys) — a config.yaml can never inject a `dataHome` that `getDataHome`
+ *    would then trust (which would let an attacker point teamai's data home,
+ *    and `uninstall`'s recursive remove, at an arbitrary directory);
+ *  - on SAVE, `serializeLocalConfig` also drops it (belt-and-braces) — the
+ *    value is anchor-derived at runtime and the config file lives INSIDE it, so
+ *    persisting an absolute path would be both redundant and machine-specific.
+ */
+export type LocalConfig = z.infer<typeof LocalConfigSchema> & { dataHome?: string };
 export type LocalConfigInput = z.input<typeof LocalConfigSchema>;
 
 // ─── Local state (~/.teamai/state.json) ────────────────────
@@ -505,15 +561,74 @@ export interface ManagedMcpRecord {
 /** ~/.teamai/managed-mcp.json — team MCP servers injected per tool+scope key. */
 export type ManagedMcpManifest = Record<string, ManagedMcpRecord[]>;
 
-/** Path of the managed-MCP manifest for a scope. */
-export function managedMcpManifestPath(scope: Scope, projectRoot?: string): string {
-  return path.join(getTeamaiHome(scope, projectRoot), 'managed-mcp.json');
+/**
+ * Ownership key for the managed-MCP manifest, per tool and scope.
+ *
+ * The P1 partition (issue #374) keys the data home by the shared `projectAnchor`,
+ * so the main checkout and every linked worktree share ONE managed-mcp.json.
+ * But a project MCP file (`<workspace>/.mcp.json`, `.codex/config.toml`, …) is
+ * per-worktree. If the manifest key were just `<tool>:project`, one worktree's
+ * reconcile/uninstall would claim ownership of — and overwrite or remove — the
+ * MCP entries another worktree wrote into ITS own workspace file. So a
+ * project-scope key must carry the CURRENT workspace identity (the per-worktree
+ * `workspaceRoot`, not the shared anchor). Both the CLI reconcile/uninstall paths
+ * and the local-agent install/uninstall/report paths must build the key here so
+ * they agree. user scope has a single global file, so no workspace segment.
+ */
+/**
+ * Ownership key for the managed-MCP manifest, per tool and scope.
+ *
+ * Each project WORKTREE now has its OWN manifest file (see managedMcpManifestPath),
+ * so the file already isolates ownership by worktree — the key needs no workspace
+ * segment. It is `<tool>:project` for project scope and `<tool>` for user scope.
+ */
+export function managedMcpManifestKey(tool: string, projectScope: boolean): string {
+  return projectScope ? `${tool}:project` : tool;
+}
+
+/** Stable per-worktree identity segment; names the worktree's manifest subdirectory (#374). */
+export function managedMcpWorkspaceId(workspaceRoot: string): string {
+  return createHash('sha1').update(workspaceRoot).digest('hex').slice(0, 12);
+}
+
+/**
+ * Path of the managed-MCP manifest.
+ *
+ * user scope keeps ONE global file at `<dataHome>/managed-mcp.json`.
+ *
+ * project scope gets a PER-WORKTREE file at
+ * `<dataHome>/workspaces/<workspaceId>/managed-mcp.json` (#374). The partition data
+ * home is shared by every linked worktree, so a single shared manifest suffered
+ * both cross-worktree ownership bleed AND lost updates under concurrent
+ * read-modify-write. A file per worktree removes both: each reconcile/install
+ * reads and rewrites only its own file, and the key needs no workspace segment.
+ */
+export function managedMcpManifestPath(dataHome: string, workspaceRoot?: string): string {
+  if (workspaceRoot) {
+    return path.join(dataHome, 'workspaces', managedMcpWorkspaceId(workspaceRoot), 'managed-mcp.json');
+  }
+  return path.join(dataHome, 'managed-mcp.json');
+}
+
+/**
+ * Legacy shared manifest path (pre-#374-per-worktree). Older installs wrote all
+ * project ownership into `<dataHome>/managed-mcp.json` (possibly under a bare
+ * `<tool>:project` key, or the interim `<tool>:project:<id>` keys). The migration
+ * on first project reconcile lifts THIS worktree's records out of that file into
+ * its per-worktree file. Same path as the user-scope file, read for compat only.
+ */
+export function legacyManagedMcpManifestPath(dataHome: string): string {
+  return path.join(dataHome, 'managed-mcp.json');
 }
 
 // ─── Global options ─────────────────────────────────────
 
 export interface GlobalOptions {
   dryRun?: boolean;
+  global?: boolean;
+  registry?: string;
+  npm?: boolean;
+  claude?: boolean;
   verbose?: boolean;
   silent?: boolean;
   /** Force full sync even when repo HEAD matches lastPullRev. */
@@ -615,8 +730,9 @@ export interface UserStats {
    */
   prompts?: number;
   /**
-   * Cumulative token usage across all reported sessions (Claude Code transcripts
-   * only; tools without transcripts contribute nothing). Privacy: counts only.
+   * Cumulative token usage across all reported sessions (Claude Code, CodeBuddy,
+   * and Codex transcripts; tools without token records contribute nothing).
+   * Privacy: counts only.
    */
   tokens?: TokenUsage;
 }
@@ -653,9 +769,10 @@ export interface UserInterventionStats {
 //
 
 /**
- * Token usage breakdown for a session/user, summed from Claude Code transcript
- * `message.usage` records (deduplicated by message id). All fields are cumulative
- * token counts; tools without a transcript (e.g. Cursor) leave these at zero.
+ * Token usage breakdown for a session/user. Claude Code and CodeBuddy usage is
+ * summed per request. Codex uses a thread-level cumulative snapshot when available;
+ * legacy rollout-scoped snapshots are summed once per transcript. All fields are
+ * cumulative token counts; tools without token records leave these at zero.
  */
 export interface TokenUsage {
   /** Sum of usage.input_tokens. */
@@ -667,6 +784,9 @@ export interface TokenUsage {
   /** Sum of usage.cache_creation_input_tokens. */
   cacheCreation: number;
 }
+
+/** Scope of a cumulative token snapshot captured from an agent transcript. */
+export type TokenSnapshotScope = 'session' | 'transcript';
 
 /** A fresh zeroed TokenUsage. */
 export function emptyTokenUsage(): TokenUsage {
@@ -699,7 +819,7 @@ export interface SessionMetrics {
   correction: number;
   /** Number of human conversation turns (UserPromptSubmit events). */
   prompts: number;
-  /** Cumulative token usage (latest Stop snapshot). */
+  /** Cumulative token usage across the logical session. */
   tokens: TokenUsage;
 }
 
@@ -743,12 +863,17 @@ export interface DashboardEvent {
    */
   interventions?: { interrupt: number; toolReject: number; toolError?: number };
   /**
-   * Cumulative token usage scanned from the transcript at Stop time. Full snapshot
-   * (idempotent): each Stop carries the running total for the whole session, so a
-   * later Stop overrides an earlier one in rebuildSessions. Absent for tools with
-   * no transcript (e.g. Cursor) and for sessions with no recorded usage.
+   * Cumulative token usage scanned from the transcript at Stop time. Absent for
+   * tools with no transcript (e.g. Cursor) and for sessions with no recorded usage.
    */
   tokens?: TokenUsage;
+  /**
+   * Scope of `tokens` when the producer exposes it. Codex `token_usage_record`
+   * snapshots cover the logical session, while legacy `event_msg.token_count`
+   * snapshots cover one rollout/transcript file. Older events and other agents omit
+   * this field and retain the historical latest-Stop behavior.
+   */
+  tokenScope?: TokenSnapshotScope;
   /**
    * Cumulative count of human prompt turns scanned from the transcript at Stop time.
    * Full snapshot (idempotent), sourced from the non-compactable transcript so the
@@ -825,6 +950,8 @@ export const CORRECTION_WINDOW_MS = 60 * 1000;
 export const CORRECTION_KEYWORDS = [
   '不对', '不是', '错了', '错误', '重来', '重新', '撤销', '回退', '别这样', '不要',
   'wrong', 'redo', 'undo', 'revert', 'mistake', 'instead', "don't", "that's not", 'not what',
+  // Japanese: "that's wrong" / "not that" / "redo" / "you got it wrong" / "on your own" / "put it back".
+  '違う', 'ちがう', 'そうじゃな', 'そうではな', 'やり直', 'やりなおし', '間違って', '間違え', '勝手に', '戻して',
 ];
 /** Max bytes to scan from a transcript when counting interventions (guards huge files). */
 export const INTERVENTION_SCAN_MAX_BYTES = 50 * 1024 * 1024;
@@ -1197,6 +1324,14 @@ export const KNOWLEDGE_WORKTREE_DIRNAME = 'knowledge-wt';
 export const REPORTS_LOCK_FILENAME = '.reports-lock';
 /** Lock filename (under <repo>/.teamai) guarding concurrent self-mode bootstrap. */
 export const BOOTSTRAP_LOCK_FILENAME = '.bootstrap-lock';
+/**
+ * Lock filename (in the project data home) serializing writes to the SHARED team
+ * clone during pull/push. All worktrees of a repo resolve to the same partition
+ * (keyed on projectAnchor), so this lock coordinates a `git pull`/`git push` that
+ * could otherwise run concurrently from the main checkout and a worktree and
+ * corrupt the shared clone.
+ */
+export const SYNC_LOCK_FILENAME = '.sync-lock';
 
 /**
  * Directory holding team knowledge assets (skills/rules/docs/learnings/...).
@@ -1207,6 +1342,31 @@ export const BOOTSTRAP_LOCK_FILENAME = '.bootstrap-lock';
  */
 export function getKnowledgeDir(localConfig: LocalConfig): string {
   return localConfig.repo.localPath;
+}
+
+/**
+ * Directory holding this project's machine-local teamai data (search index,
+ * env backup, managed manifests, local-agent resource cache, and — in a later
+ * phase — config.yaml/state.json and the team-repo clone).
+ *
+ * This is the single source of truth for the machine-data home, sitting beside
+ * `getKnowledgeDir` (team knowledge assets) and `resolveBaseDir` (AI-tool
+ * resource landing = the workspace root). The three are orthogonal:
+ * knowledge / resource-landing / machine-data.
+ *
+ * Today it returns `getTeamaiHome(scope, projectRoot)` — i.e. `<projectRoot>/.teamai`
+ * for project scope, `~/.teamai` for user scope. A later phase (P1) redirects the
+ * project-scope case to a per-project partition under `~/.teamai/projects/<slug>/`
+ * keyed by the shared `projectAnchor`; every consumer already routes through this
+ * function, so that redirect happens in one place.
+ */
+export function getDataHome(localConfig: LocalConfig): string {
+  // A resolved partition dataHome (attached at detection/init) wins. Otherwise
+  // fall back to the legacy in-workspace location. In the P1-2A refactor no
+  // caller attaches dataHome yet, so this is still exactly getTeamaiHome — the
+  // partition redirect is switched on in P1-2B by making detection attach it.
+  if (localConfig.dataHome) return localConfig.dataHome;
+  return getTeamaiHome(localConfig.scope, localConfig.projectRoot);
 }
 
 /**
@@ -1254,7 +1414,13 @@ export function getTeamaiHome(scope: Scope, projectRoot?: string): string {
  * through this helper so they never disagree on the path.
  */
 export function getEnvBackupPath(localConfig: LocalConfig): string {
-  const home = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+  // Route through getDataHome (not getTeamaiHome directly) so the plaintext
+  // env backup follows the machine-data home together with env.sh. Otherwise
+  // P1-2's partition redirect would move env.sh into ~/.teamai/projects/<slug>/
+  // while leaving the KEY=value backup (which carries plaintext values) behind
+  // in <projectRoot>/.teamai — breaking "zero workspace residue" and leaking
+  // sensitive values into the business repo directory.
+  const home = getDataHome(localConfig);
   return path.join(home, isSelfMode(localConfig) ? 'env.local' : 'env');
 }
 
@@ -1266,10 +1432,12 @@ export function getConfigPath(scope: Scope, projectRoot?: string): string {
 }
 
 /**
- * Get the state.json path for a given scope.
+ * Get the state.json path for a config. state.json is per-project machine data
+ * that lives beside config.yaml in the data home, so it routes through
+ * getDataHome (partition-aware in P1-2B).
  */
-export function getStatePath(scope: Scope, projectRoot?: string): string {
-  return path.join(getTeamaiHome(scope, projectRoot), 'state.json');
+export function getStatePath(localConfig: LocalConfig): string {
+  return path.join(getDataHome(localConfig), 'state.json');
 }
 
 /**

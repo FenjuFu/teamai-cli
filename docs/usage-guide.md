@@ -2,14 +2,15 @@
 
 > [English](usage-guide.md) | [简体中文](usage-guide.zh-CN.md)
 
-> **teamai-cli** — a shared AI experience framework for teams
+> **teamai-cli** — the team collaboration layer for AI agents
 >
-> Helps teams centrally manage and share Skills, Rules, Docs, and Env resources, automatically syncing them to AI coding tools like Claude Code, CodeBuddy, Cursor, Codex, OpenCode, Gemini CLI, and Windsurf.
+> **Make every team continuously smarter with AI.** Define how agents work (Team Execution), give them team knowledge (Team Context), and turn real sessions into shared capability (Team Improvement). Skills, Rules, Docs, Env, MCP, and more sync automatically to Claude Code, CodeBuddy, Cursor, Codex, OpenCode, Gemini CLI, Windsurf, and others.
 
 ---
 
 ## Table of Contents
 
+- [What TeamAI is](#what-teamai-is)
 - [Core Concepts](#core-concepts)
 - [Installation](#installation)
 - [Admin Initialization](#admin-initialization)
@@ -30,16 +31,36 @@
 
 ---
 
+## What TeamAI is
+
+Agents are strong as personal tools, but their learning stays personal: what one member's agent worked out yesterday does not reach anyone else's agent today.
+
+TeamAI's product is one loop, not three separate products:
+
+| Layer | Job | What you do in this CLI |
+|-------|-----|-------------------------|
+| **Team Execution** | Make every agent work the team's way | `init` / `pull` / `push` the shared harness (skills, rules, agents, hooks, MCP, env) |
+| **Team Context** | Make every agent understand the team | recall, docs, learnings, codebase graph |
+| **Team Improvement** | Make every execution improve the team | friction-based share-learnings, sessions, digest |
+
+**Execute → Understand → Learn → Self-Improve.** Start with harness distribution; context and improvement grow as the team actually runs agents.
+
+---
+
 ## Core Concepts
 
 | Concept | Description |
 |------|------|
-| **Team Repo** | A Git repository that centrally stores a team's shared Skills / Rules / Docs / Env resources |
+| **Team Repo** | A Git repository that centrally stores the team's harness and knowledge (Skills / Rules / Docs / Env / Packages, plus learnings and wiki) |
 | **Scope** | Where resources are installed: `project` (current project, default) or `user` (home directory) |
+| **Team Execution** | One shared harness, distributed to every member's agents |
+| **Team Context** | Searchable team knowledge so agents do not start from zero each session |
+| **Team Improvement** | Session friction and usage signals that become new skills, rules, and knowledge |
 | **Skills** | Custom skills the AI can invoke (a directory containing a `SKILL.md`) |
 | **Rules** | Markdown-formatted team conventions, automatically merged into AI tool configs |
 | **Docs** | Shared team documentation for the AI to reference |
 | **Env** | Shared team environment variables, automatically injected into the shell |
+| **Packages** | Team-wide npm packages and Claude Code plugins, installed explicitly with `teamai packages` |
 
 ```
 ┌───────────────┐    teamai push (MR)    ┌───────────────────┐
@@ -183,7 +204,7 @@ teamai init . --agent claude,codex   # non-interactive: set up Claude Code + Cod
 
 **Choosing which AI tools to set up.** Single-repo mode creates a per-tool directory in your repo (e.g. `.claude/`, `.codex/`) — it seeds the skills dir, injects the teamai hooks, and commits that tool's settings to main so teammates get them on clone. You control which tools:
 
-- **`--agent <name...>`** — explicit list, repeatable or comma-separated: `--agent claude`, `--agent claude,codex`, `--agent claude --agent cursor`. Supported ids: `claude`, `codex`, `cursor`, `codebuddy`, `workbuddy`, `dsh` (DeepSeek Harness).
+- **`--agent <name...>`** — explicit list, repeatable or comma-separated: `--agent claude`, `--agent claude,codex`, `--agent claude --agent cursor`. Supported ids include `claude`, `codex`, `cursor`, `joycode`, `codebuddy`, `workbuddy`, and `dsh` (DeepSeek Harness).
 - **Interactive (no `--agent`, a terminal)** — teamai shows a multi-select. Option 1 is **Auto**, which lists the AI tools already installed on your machine (`~/.claude`, `~/.codex`, …) and is the Enter default; the remaining options are the individual tools. Auto and specific tools can be combined.
 - **Non-interactive (no `--agent`, no terminal — CI, hooks, clone-time bootstrap)** — teamai mirrors the tools you already use under your home dir (`~/.claude`, `~/.codex`, …). If none are found, it creates nothing (you still get the knowledge; run `teamai init .` later to pick tools).
 
@@ -197,7 +218,7 @@ teamai init . --agent claude,codex   # non-interactive: set up Claude Code + Cod
 
 **Clone = initialized.** Because knowledge and the `mode: self` marker in `.teamai/teamai.yaml` are committed to main, a teammate who clones the repo is auto-initialized: the next `teamai` command or AI session detects the marker, and (when their git provider is already authenticated) writes their local config, injects hooks, and registers them on the reports branch — no need to re-type repo/role. If they aren't authenticated yet, teamai prompts them to run `teamai init .` once.
 
-**Safety.** Every git write teamai performs in single-repo mode (knowledge PRs and the reports orphan branch) runs in an isolated git worktree under `.teamai/`. Your working tree and current branch are never checked out, reset, or switched.
+**Safety.** Every git write teamai performs in single-repo mode (knowledge PRs and the reports orphan branch) runs in an isolated git worktree under `.teamai/`. Your working tree and current branch are never checked out, reset, or switched. Isolated worktree commits skip local git hooks (for example husky / lint-staged): a clean checkout from `origin/<default>` often has hook scripts without the locally generated `husky.sh`, and knowledge/report files should not run the business-repo lint pipeline. Your ordinary `git commit` in the business repo still runs hooks.
 
 **Admin checklist after `teamai init .`:**
 
@@ -293,6 +314,8 @@ teamai skill show hai-deploy-test   # View a single skill's source / contributor
 
 `teamai init` already injected Hooks into your AI tools. **`teamai pull` runs automatically every time you start an AI session** — no manual action needed. In project scope, that SessionStart hook first creates the current agent's project root (e.g. `<project>/.claude` when Claude Code opens the repo) if it is missing, then pulls.
 
+*(Note: Automatic sync on session start requires an agent that supports lifecycle hooks, such as Claude Code, Codex, Cursor, CodeBuddy, WorkBuddy, Qoder, OpenCode, Hermes, or OpenClaw. For tools without hooks support such as JoyCode or Gemini CLI, session start hooks do not fire, so you should run `teamai pull` manually to keep resources up to date.)*
+
 If you need to sync immediately, you can run it manually:
 
 ```bash
@@ -303,6 +326,75 @@ teamai pull --dry-run    # Dry run, no actual changes
 > Project scope is isolated by default. When the current working directory contains a project-scope `.teamai/config.yaml`, `pull` processes that project and skips user scope unless the local config has `inheritUserScope: true`; in that case it first refreshes the safe user-resource channel. Without a project config in the current directory, `pull` processes user scope. User `env`, MCP definitions, sources, reporting, and writes remain isolated in project mode. Hooks are the one exception: a project scope's hooks are injected into your **HOME** tool settings (`~/.claude/settings.json`, …), not `<projectRoot>`, because the built-in hooks gate on the `cwd` handed to `hook-dispatch` and `~/.claude` always exists so the "installed tool" gate passes (see the Hooks section). Self single-repo mode keeps its hooks in the business repo so they travel on clone.
 
 With role-based skills enabled, `pull`'s skill sync source becomes the contents of `skills/<namespace>/`, expanded according to `primaryRole + additionalRoles` and flattened into each local AI tool's skills directory. `rules/`, `docs/`, and `learnings/` keep their original global sync behavior.
+
+### Team packages
+
+`teamai packages` lets a team declare and restore npm packages and Claude Code plugins through the existing team repository. TeamAI invokes the native `npm` and `claude plugin` CLIs; it does not distribute package contents itself.
+
+**Admin operations:**
+
+Passing a target installs it and adds its declaration to the team repo's `teamai.yaml`:
+
+```bash
+# npm package (project dependency by default)
+teamai packages install typescript
+
+# Unscoped name@version is ambiguous with plugin@marketplace; identify npm explicitly
+teamai packages install typescript@5.9.2 --npm
+
+# Global npm CLI from a specific registry
+teamai packages install eslint@latest --global \
+  --registry https://registry.npmjs.org/
+
+# Claude plugin
+teamai packages install code-review@claude-plugins-official
+
+# Share the updated teamai.yaml through the normal review flow
+teamai push
+```
+
+An npm target accepts `name` or `name@version`. Because an unscoped `name@value` can also mean `plugin@marketplace`, use `--npm` when the suffix is not a declared or registered Claude marketplace. Scoped npm names (`@scope/name`), bare names, `--global`, and `--registry` already identify npm unambiguously and do not probe the Claude CLI. Local npm packages require a `package.json` in the current directory; use `--global` for machine-wide CLI tools. `--registry` is saved with that package declaration and must be an HTTP(S) URL without embedded credentials. Keep registry authentication in npm configuration or environment variables.
+
+A Claude plugin target uses `plugin@marketplace`. The official `claude-plugins-official` marketplace is resolved automatically; another marketplace must already be registered with Claude Code so TeamAI can record its source. Use `--claude` to make the intended ecosystem explicit and get a marketplace-specific error when it is unavailable. Ambiguous targets fail without running either package manager. `--global` and `--registry` apply only to npm targets.
+
+**Member operations:**
+
+The existing SessionStart hook runs `teamai pull`. When the `packages` declaration changes, it asks the member to review `teamai.yaml` and install explicitly; it never runs third-party package or plugin code automatically. Pull remains detached so network latency cannot block the IDE. If a declaration arrives after the SessionStart output window, TeamAI safely queues the same notice for the next UserPromptSubmit in that session.
+
+```bash
+teamai packages             # Install every team declaration
+teamai packages --dry-run   # Preview native commands without installing or writing files
+teamai doctor              # Check runtimes and declared package/marketplace/plugin status
+```
+
+After a successful install, TeamAI writes a local snapshot to `teamai.lock` under the active scope's `.teamai` directory. The lock records installed versions and the declaration hash used by the SessionStart hint; it is not stored in the team repository. In user scope, machine-wide npm tools and Claude plugins are acknowledged once, while project npm dependencies are acknowledged separately for each working directory so installing in one repository cannot silence another repository's hint.
+
+**Declaration format:**
+
+`teamai packages install <target>` manages this section automatically:
+
+```yaml
+packages:
+  npm:
+    - name: typescript
+      version: "*"
+    - name: eslint
+      version: latest
+      global: true
+      registry: https://registry.npmjs.org/
+  claude:
+    marketplaces:
+      - name: claude-plugins-official
+        repo: anthropics/claude-plugins-official
+    plugins:
+      - name: code-review@claude-plugins-official
+```
+
+- `npm[].version` defaults to `*`; `global` defaults to `false`.
+- `claude.marketplaces` maps marketplace names to their repositories.
+- Each Claude plugin must use `plugin@marketplace`, and that marketplace must be declared.
+- Unknown or misspelled keys inside `packages` are rejected before install or push.
+- Package declarations apply to the whole team; role and project filters do not change the package set.
 
 ### Excluding skills you don't need
 
@@ -405,6 +497,8 @@ teamai pull
 
 ## Sharing Team Resources
 
+This is Team Execution: define skills, rules, and other harness once, review via MR, then `teamai pull` delivers them to every agent.
+
 ### Skills
 
 ```bash
@@ -504,9 +598,10 @@ Where each tool's servers land:
 | cursor | `~/.cursor/mcp.json` | `<project>/.cursor/mcp.json` |
 | codebuddy / workbuddy | `~/.<tool>/mcp.json` | `<project>/.<tool>/mcp.json` |
 | codex | `~/.codex/config.toml` | not supported |
+| qoder | `~/.qoder/settings.json` | `<project>/.qoder/settings.json` |
 | opencode | `~/.config/opencode/opencode.json` | `<project>/opencode.json` |
 
-Codex supports `stdio` and `http`; `sse` is skipped. OpenCode supports `stdio` (written as its `type:"local"` shape) and `http` (`type:"remote"`); `sse` is skipped, and its servers live under the `mcp` key of the shared `opencode.json`. Ownership is tracked in `~/.teamai/managed-mcp.json` — hand-added servers are left alone; name collisions skip unless `--force`.
+Codex supports `stdio` and `http`; `sse` is skipped. Qoder supports the Claude-compatible `mcpServers` format in its scope-specific `.qoder/settings.json`. OpenCode supports `stdio` (written as its `type:"local"` shape) and `http` (`type:"remote"`); `sse` is skipped, and its servers live under the `mcp` key of the shared `opencode.json`. Ownership is tracked in `~/.teamai/managed-mcp.json` — hand-added servers are left alone; name collisions skip unless `--force`.
 
 **Secrets.** Write `${VAR}`, never a literal, in `mcp.yaml`. Values resolve from the environment, then from `env/env.yaml` → `~/.teamai/env`. Unresolved variables skip the server with a hint.
 
@@ -526,6 +621,8 @@ teamai mcp remove            # remove every teamai-managed server
 ---
 
 ## Knowledge Capture & Retrieval
+
+This is Team Context plus the start of Team Improvement: capture what a session actually learned, then let the next agent find it.
 
 ### Contributing knowledge
 
@@ -547,6 +644,18 @@ You can also specify a file manually:
 teamai contribute --file /tmp/session.md
 teamai contribute --file /tmp/session.md --scope project
 ```
+
+#### Turning the hint off
+
+Teams that route knowledge sharing through their own review flow (for example, a personal retrospective that opens ordinary PRs) can switch the hint off without touching the rest of the Stop hook — update checks, votes sync, and dashboard reporting keep running. Same two-tier pattern as recall:
+
+| Tier | Config file | Field | Description |
+|------|----------|------|------|
+| Team default | `teamai.yaml` | `sharing.contributeHint.enabled` | `true` (default) / `false` |
+| User override | `~/.teamai/config.yaml` | `contributeHintEnabled` | `true` / `false`, takes priority over the team default |
+| Environment variable | shell | `TEAMAI_CONTRIBUTE_HINT_DISABLED=1` | Force-disables the hint (emergency kill switch) |
+
+Only the nudge is affected: friction scoring, `teamai contribute --file`, and `/teamai-share-learnings` keep working when invoked manually.
 
 ### Searching knowledge
 
@@ -848,6 +957,46 @@ When using `teamai init --http <baseUrl>`, the endpoint must implement the follo
 }
 ```
 
+The backend may push an **`apply_model_config`** task whose `cmd` is JSON. Both
+the documented candidate-set shape and the legacy single-model shape are accepted.
+`{"models":[...]}` is a full snapshot; a direct model object is an incremental upsert.
+`max_tokens` is optional (CodeBuddy `maxOutputTokens`); omitted or `0` defaults to `4096`. Claude does not use it.
+
+```jsonc
+{ "id": 16, "type": "apply_model_config",
+  "cmd": "{\"models\":[{\"provider\":\"openai\",\"model_id\":\"gpt-4o\",\"name\":\"GPT-4o\",\"base_url\":\"https://proxy.example.com/v1\",\"api_key\":\"<ProxyToken>\",\"max_tokens\":4096,\"context_window\":128000}]}" }
+```
+
+The candidate set is applied only to the agent that reported the task. CodeBuddy uses
+its user-level `~/.codebuddy/models.json`; user-owned entries with the same model ID
+are preserved. Claude gets an explicit profile at `~/.claude/teamai-models.json` and
+also receives the gateway environment in `~/.claude/settings.json` when it has no
+conflicting user-owned Anthropic gateway configuration. Unsupported agents acknowledge
+the task as failed instead of writing another agent's config. Symlinked user config
+files remain symlinks. These files are mode `0600`. A successful write is acknowledged with
+`type: "apply_model_config"`; malformed payloads are acknowledged as `failed`. Unknown
+future task types are silently skipped for protocol compatibility.
+
+The reverse direction is reported through the existing `report` call: models that
+TeamAI recorded in its model manifest and can still identify by model ID and provider
+on disk are sent as `user_level.models`. Normal agent-added metadata does not suppress
+the report. A successful apply triggers this report immediately in the same sync run.
+User-owned models are omitted because the backend cannot resolve them. The server
+requires both `provider` and `model_id`. Like skills and rules, the field is omitted
+entirely when nothing qualifies, because a present array is treated as a full
+snapshot. Only CodeBuddy (`~/.codebuddy/models.json`) and Claude (the
+`ANTHROPIC_CUSTOM_MODEL_OPTION` gateway in `~/.claude/settings.json`) expose a
+discoverable model config; other tools report nothing. Reported entries always use
+`source: "enterprise"`. **`api_key` is never reported back** — the ProxyToken stays
+on disk.
+
+```jsonc
+{ "agent_type": "codebuddy", "local_agent_id": "...",
+  "user_level": { "models": [
+    { "provider": "tokenhub", "model_id": "gpt-4o", "name": "GPT-4o", "source": "enterprise" }
+  ] } }
+```
+
 The backend may also push an **`uninstall_teamai`** command to remove the local agent. It carries a `cmd` (a single `teamai` subcommand) that runs once on the client, with the result reported back through the same ack channel:
 
 ```json
@@ -975,7 +1124,7 @@ Each session card shows a `⚠ N` badge, counting the **number of human interven
 |------|------|----------|
 | `interrupt` | User pressed ESC to interrupt the agent mid-execution | An interrupted turn in the transcript |
 | `toolReject` | User rejected a tool call (permission deny) | A tool_result marked as rejected in the transcript |
-| `correction` | Within 60s after the agent stops, the user submits a follow-up prompt containing a correction keyword ("not right" / "redo" / "wrong" / etc.) | The stop → prompt_submit event pattern |
+| `correction` | Within 60s after the agent stops, the user submits a follow-up prompt containing a correction keyword ("not right" / "redo" / "wrong" / 「違う」 / 「やり直し」 / etc. — Chinese, English and Japanese) | The stop → prompt_submit event pattern |
 
 > Privacy: only counts are tracked — no prompt or transcript text is ever stored.
 
@@ -988,7 +1137,7 @@ Each session card also shows two badges:
 | Badge | Meaning | Data source |
 |------|------|----------|
 | `💬 N` | The **number of human conversation turns** in the session (how many prompts were sent) | Count of `UserPromptSubmit` events |
-| `⛁ X` | The session's cumulative **token usage** (hover to see input / output / cache read / cache write breakdown) | Claude Code transcript's `message.usage` (deduplicated by `message.id` to avoid double counting) |
+| `⛁ X` | The session's cumulative **token usage** (hover to see input / output / cache read / cache write breakdown) | Claude Code `message.usage`, CodeBuddy `requests[].usage`, or Codex's latest session-level `token_usage_record`; legacy `event_msg.token_count` snapshots are summed once per rollout file |
 
 > Privacy: only turn counts and token counts are tracked — no prompt or transcript text is ever stored.
 
@@ -1089,6 +1238,20 @@ team-repo/
 - **Rules** are copied into `.opencode/rules/` (or `~/.config/opencode/rules/`), but OpenCode does not auto-scan a rules directory — the files are inert until referenced. teamai therefore adds a `rules/*.md` glob to the `instructions` array in `opencode.json` and removes it again when the team's last rule goes away, editing only that one key and leaving your own `instructions` entries untouched.
 - **Hooks** are delivered as an OpenCode *plugin*, not a settings-file entry — OpenCode has no `hooks` array; it auto-loads JS/TS plugins from **both** `~/.config/opencode/plugin/` and `<project>/.opencode/plugin/`. A plugin present in both dirs is loaded twice and would dispatch every event twice, so teamai keeps exactly one copy: `teamai-hooks.ts` in the user dir, which covers every project. Any project-scope copy left by an earlier layout is deleted on the next sync. This matches the other tools, whose `settings.json` hooks also live in HOME and gate on the `cwd` handed to `hook-dispatch`. The plugin subscribes to OpenCode's own events and shelling out to the same `teamai hook-dispatch` entry point every other tool uses. The event mapping mirrors the Claude built-in set: `session.created` → session-start, `session.idle` → stop, `chat.message` → prompt-submit, `tool.execute.after` → post-tool-use. The plugin forwards the same STDIN payload other agents send (`cwd`, `tool_name`, `tool_input`, `prompt`), and maps OpenCode's lowercase tool ids (`skill`, `todowrite`) back to the PascalCase matchers the handler registry expects. OpenCode cannot inject a hook's stdout back into the session, so hooks run purely for their side effects (status report / sync / update). Note that OpenCode *awaits* its named hooks (`chat.message`, `tool.execute.after`), so those dispatches briefly wait on the `teamai` subprocess before the agent continues; the errors are always swallowed so a hook can never fail the session. Server-pushed agent hooks (`teamai-agent-<slug>.ts`) install into the same user plugin dir.
 - **MCP** servers live under the `mcp` key of the shared `opencode.json` (see the MCP section above).
+
+### Qoder
+
+Qoder is available as a built-in target. TeamAI deploys skills, rules, and subagents to `.qoder/skills/`, `.qoder/rules/`, and `.qoder/agents/`. Hooks and MCP servers are merged into the scope-specific `.qoder/settings.json`, preserving unrelated user settings. The paths match Qoder's user and project configuration contracts.
+
+### JoyCode
+
+JoyCode is available as a built-in target. Skills, rules, and subagents are deployed to `.joycode/skills/`, `.joycode/rules/`, and `.joycode/agents/`. Rules use Cursor-compatible `.mdc` files, including the same derived frontmatter and body-only round-trip behavior described below. Subagents use Markdown with YAML frontmatter.
+
+JoyCode rule cleanup is conservative: local `.mdc` and `.md` files absent from the team rule list are preserved unless an explicit team removal tombstone exists. This protects personal rules in the shared directory; an old team copy without a deletion record is retained rather than guessed to be stale.
+
+For canonical YAML agents, push compares each local file with the corresponding tool rendering and merges only actual edits back into the original spec. Deployment `targets`, other tools' metadata, and fields absent from a tool's native format are preserved. Conflicting or unparseable edits are skipped rather than replacing the canonical agent.
+
+**Hooks & Manual Sync**: JoyCode currently does not provide a lifecycle hooks mechanism or dedicated launcher/startup adapter (no `settings.json` hook array or `hooks.json` format). Consequently, opening JoyCode does not fire TeamAI's `SessionStart` event, and cannot trigger background `teamai pull`, telemetry reporting (`teamai track`), or auto-update checks. Users working with JoyCode must run `teamai pull` manually in the terminal to synchronize team resources, and `teamai push` to contribute changes. If JoyCode adds hooks or extension lifecycle events in future releases, a dedicated hook adapter can be connected.
 
 ### Cursor
 
@@ -1202,6 +1365,11 @@ provider: github
 reviewers:
   - reviewer1
 
+packages:
+  npm:
+    - name: typescript
+      version: "*"
+
 sharing:
   rules:
     enforced: [code-review-guide]
@@ -1211,6 +1379,8 @@ sharing:
     injectShellProfile: true
   coAuthor:
     enabled: false             # optional; strip AI-tool commit trailers team-wide
+  contributeHint:
+    enabled: true              # optional; false = no /teamai-share-learnings nudge after high-friction sessions
 ```
 
 ### config.yaml (local config)
@@ -1225,6 +1395,7 @@ scope: project                 # project (default from init) or user
 projectRoot: /path/to/project  # project scope only
 inheritUserScope: true         # optional; project scope only, defaults to false
 coAuthorEnabled: true          # optional; per-machine co-author override
+contributeHintEnabled: false   # optional; per-machine override of sharing.contributeHint.enabled
 ```
 
 ---
