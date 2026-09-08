@@ -129,6 +129,33 @@ describe('builtin-rules', () => {
             const deployed = await deployBuiltinRules(teamConfig);
             expect(deployed).toBe(1);
         });
+
+        it('does not overwrite a personal teamai-recall in an auto-discovered tool dir', async () => {
+            // cursor auto-discovered (not in toolPaths); a personal teamai-recall.mdc pre-exists.
+            const cursorRulesDir = path.join(tmpDir, '.cursor', 'rules');
+            fs.mkdirSync(cursorRulesDir, { recursive: true });
+            fs.writeFileSync(path.join(cursorRulesDir, 'teamai-recall.mdc'), 'PERSONAL RECALL CONTENT');
+            fs.mkdirSync(path.join(tmpDir, '.claude', 'rules'), { recursive: true });
+
+            const teamConfig = {
+                team: 'test', description: '', repo: 'https://git.woa.com/test/repo.git',
+                provider: 'tgit', reviewers: [],
+                sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+                toolPaths: { claude: { rules: '.claude/rules' } },
+            } as any;
+            const localConfig = {
+                repo: { localPath: path.join(tmpDir, 'repo'), remote: 'r' },
+                username: 'u', additionalRoles: [], scope: 'user',
+            } as any;
+
+            const { deployBuiltinRules } = await import('../builtin-rules.js');
+            await deployBuiltinRules(teamConfig, localConfig);
+
+            // Personal cursor rule preserved; claude (team-managed) still got the built-in.
+            expect(fs.readFileSync(path.join(cursorRulesDir, 'teamai-recall.mdc'), 'utf-8'))
+                .toBe('PERSONAL RECALL CONTENT');
+            expect(fs.existsSync(path.join(tmpDir, '.claude', 'rules', 'teamai-recall.md'))).toBe(true);
+        });
     });
 
     describe('BUILTIN_RULE_NAMES', () => {

@@ -510,6 +510,32 @@ describe('pull role-aware sync and cleanup', () => {
       .toBe('PERSONAL GHOST');
   });
 
+  it('withdrawing a cursor rule does NOT delete a personal same-name .md beside the teamai .mdc (P1 ext-scoped)', async () => {
+    // cursor auto-discovered; personal safety.md (no .mdc) pre-exists.
+    await fse.ensureDir(path.join(homeDir, '.cursor', 'rules'));
+    await fse.writeFile(path.join(homeDir, '.cursor', 'rules', 'safety.md'), 'PERSONAL RULE CONTENT');
+    await fse.writeFile(path.join(repoPath, 'rules', 'safety.md'), 'TEAM RULE CONTENT');
+
+    // First pull: teamai writes safety.mdc into cursor and records ownership of
+    // safety.mdc (NOT safety.md). Personal safety.md is left intact.
+    await pull({ force: true });
+    expect(await fse.pathExists(path.join(homeDir, '.cursor/rules', 'safety.mdc'))).toBe(true);
+    expect(await fse.readFile(path.join(homeDir, '.cursor/rules', 'safety.md'), 'utf-8'))
+      .toBe('PERSONAL RULE CONTENT');
+
+    // Team recalls the rule.
+    await fse.remove(path.join(repoPath, 'rules', 'safety.md'));
+    await fse.writeFile(path.join(repoPath, 'rules', '.removed'), 'safety\n');
+
+    // Second pull: the teamai-deployed safety.mdc is withdrawn, but the personal
+    // safety.md must survive — its filename was never in the ownership record.
+    await pull({ force: true });
+    expect(await fse.pathExists(path.join(homeDir, '.cursor/rules', 'safety.mdc'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.cursor/rules', 'safety.md'))).toBe(true);
+    expect(await fse.readFile(path.join(homeDir, '.cursor/rules', 'safety.md'), 'utf-8'))
+      .toBe('PERSONAL RULE CONTENT');
+  });
+
   it('cleans up stale skills after role change (full pull cycle)', async () => {
     // Setup: create skills in all namespaces
     await fse.ensureDir(path.join(repoPath, 'skills', 'common', 'shared-skill'));

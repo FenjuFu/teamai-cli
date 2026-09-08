@@ -398,7 +398,7 @@ export class AgentsHandler extends ResourceHandler {
         const { ext, content: rendered } = renderForTool(spec, tool);
         const dest = path.join(destDir, `${item.name}${ext}`);
 
-        const key = ownershipKey(tool, 'agents', item.name);
+        const key = ownershipKey(tool, 'agents', path.basename(dest));
         if (!scopedKeys.has(tool)) {
           if (state === null) state = await loadStateForScope(localConfig);
           if (!await mayWriteAutoDiscovered(dest, key, state)) {
@@ -495,7 +495,7 @@ export class AgentsHandler extends ResourceHandler {
         await ensureDir(destDir);
         const dest = path.join(destDir, `${item.name}.md`);
 
-        const key = ownershipKey(tool, 'agents', item.name);
+        const key = ownershipKey(tool, 'agents', path.basename(dest));
         if (!scopedKeys.has(tool)) {
           if (state === null) state = await loadStateForScope(localConfig);
           if (!await mayWriteAutoDiscovered(dest, key, state)) {

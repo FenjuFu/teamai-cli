@@ -661,18 +661,22 @@ async function pullForScope(
           : [ext];
 
         for (const name of tombstones) {
-          const key = ownershipKey(tool, type, name);
           if (tombstoneState === null) tombstoneState = await loadStateForScope(localConfig);
-          if (!isAutoDiscoveredTracked(key, tombstoneState)) continue; // personal — keep
+          // Authorize deletion PER FILE: the ownership record is keyed by the
+          // exact deployed filename (incl. extension), so a `.mdc` teamai
+          // deployed never authorizes deleting a personal `.md` beside it.
           for (const extension of extensions) {
-            const localPath = path.join(baseDir, dir, extension ? `${name}${extension}` : name);
+            const filename = extension ? `${name}${extension}` : name;
+            const key = ownershipKey(tool, type, filename);
+            if (!isAutoDiscoveredTracked(key, tombstoneState)) continue; // personal or absent — keep
+            const localPath = path.join(baseDir, dir, filename);
             if (await pathExists(localPath)) {
               await remove(localPath);
-              log.debug(`[${scopeLabel}] Cleaned up tombstoned teamai-deployed ${type} ${name} from auto-discovered ${dir}`);
+              log.debug(`[${scopeLabel}] Cleaned up tombstoned teamai-deployed ${type} ${filename} from auto-discovered ${dir}`);
             }
+            unmarkAutoDiscovered(key, tombstoneState);
+            tombstoneStateDirty = true;
           }
-          unmarkAutoDiscovered(key, tombstoneState);
-          tombstoneStateDirty = true;
         }
       }
     }

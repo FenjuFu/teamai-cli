@@ -9,6 +9,8 @@ import { ResourceHandler } from './resources/base.js';
 import { getUserHome } from './utils/home.js';
 import { ALL_SUPPORTED_TOOLS, renderForTool, reverseFromClaude } from './resources/agent-format.js';
 import type { ToolName } from './resources/agent-format.js';
+import { loadStateForScope, saveStateForScope } from './config.js';
+import { ownershipKey, mayWriteAutoDiscovered, markAutoDiscovered } from './resources/auto-discovered-ownership.js';
 
 // ─── Built-in agents deployment ──────────────────────────
 //
@@ -117,6 +119,12 @@ export async function deployBuiltinAgents(
   const baseDir = localConfig ? resolveBaseDir(localConfig) : getUserHome();
   let deployed = 0;
 
+  // Built-in agents deploy into auto-discovered dirs too; protect personal
+  // same-named agents the same way built-in skills/rules do.
+  const scopedKeys = new Set(Object.keys(scopedToolPaths(teamConfig, localConfig ?? {})));
+  let state: Awaited<ReturnType<typeof loadStateForScope>> | null = null;
+  let stateDirty = false;
+
   for (const [tool, toolPath] of Object.entries(localConfig ? await effectiveToolPaths(teamConfig, localConfig) : scopedToolPaths(teamConfig, localConfig ?? {}))) {
     if (!toolPath.agents) {
       log.debug(`Skipping built-in agent deployment for ${tool}: no agents path`);
@@ -136,6 +144,7 @@ export async function deployBuiltinAgents(
     }
 
     const targetAgentsDir = path.join(baseDir, toolPath.agents);
+    const autoDiscovered = !!localConfig && !scopedKeys.has(tool);
     try {
       await ensureDir(targetAgentsDir);
     } catch (e) {
@@ -155,18 +164,39 @@ export async function deployBuiltinAgents(
         }
         const rendered = renderForTool(parsed.spec, tool as ToolName);
         const stem = path.basename(file, '.md');
-        // Clean up any same-stem sibling with a different extension before
-        // writing the (possibly new) native extension — e.g. an upgrade that
-        // switches a tool from .md to .toml must not leave the stale .md behind
-        // (it would be invalid TOML for Codex, or invalid frontmatter for Claude).
-        await removeStaleAgentSiblings(targetAgentsDir, stem, rendered.ext);
         const dest = path.join(targetAgentsDir, `${stem}${rendered.ext}`);
+
+        // Auto-discovered: only overwrite an agent teamai deployed itself, and
+        // never touch same-stem siblings there (they may be personal files).
+        const key = ownershipKey(tool, 'agents', `${stem}${rendered.ext}`);
+        if (autoDiscovered) {
+          if (state === null) state = await loadStateForScope(localConfig!);
+          if (!await mayWriteAutoDiscovered(dest, key, state)) {
+            log.warn(`Preserving personal agent ${stem} in ${tool} (${dest}): not deployed by teamai, not overwriting.`);
+            continue;
+          }
+        } else {
+          // Clean up any same-stem sibling with a different extension before
+          // writing the (possibly new) native extension — e.g. an upgrade that
+          // switches a tool from .md to .toml must not leave the stale .md behind
+          // (it would be invalid TOML for Codex, or invalid frontmatter for Claude).
+          await removeStaleAgentSiblings(targetAgentsDir, stem, rendered.ext);
+        }
+
         await writeFile(dest, rendered.content);
+        if (autoDiscovered && state !== null) {
+          markAutoDiscovered(key, state);
+          stateDirty = true;
+        }
         deployed++;
       } catch (e) {
         log.warn(`Failed to deploy built-in agent ${file} to ${tool}: ${(e as Error).message}`);
       }
     }
+  }
+
+  if (stateDirty && state !== null && localConfig) {
+    await saveStateForScope(state, localConfig);
   }
 
   return deployed;

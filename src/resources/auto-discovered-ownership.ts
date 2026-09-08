@@ -15,9 +15,18 @@ import { pathExists } from '../utils/fs.js';
  * persists it (load-modify-save), mirroring how coAuthorManaged is handled.
  */
 
-/** Stable key for one deployed resource in one tool. */
-export function ownershipKey(tool: string, type: ResourceType, name: string): string {
-  return `${tool}:${type}:${name}`;
+/**
+ * Stable key for one deployed FILE in one tool.
+ *
+ * `id` must identify the exact on-disk artifact, INCLUDING its extension where
+ * one applies (e.g. a cursor rule is `safety.mdc`, a Codex agent `x.toml`).
+ * Skills are directories, so their id is just the skill name. Encoding the
+ * extension is essential: teamai may deploy `safety.mdc` while a personal
+ * `safety.md` sits beside it — a key without the extension would authorize
+ * deleting the personal `.md` during withdrawal.
+ */
+export function ownershipKey(tool: string, type: ResourceType, id: string): string {
+  return `${tool}:${type}:${id}`;
 }
 
 /**

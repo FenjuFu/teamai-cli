@@ -8,6 +8,8 @@ import type { TeamaiConfig, LocalConfig } from './types.js';
 import { resolveBaseDir, isAgentDisabled, scopedToolPaths, effectiveToolPaths } from './types.js';
 import fs from 'node:fs/promises';
 import { getUserHome } from './utils/home.js';
+import { loadStateForScope, saveStateForScope } from './config.js';
+import { ownershipKey, mayWriteAutoDiscovered, markAutoDiscovered } from './resources/auto-discovered-ownership.js';
 
 // ─── Built-in rules deployment ──────────────────────────
 //
@@ -58,6 +60,13 @@ export async function deployBuiltinRules(
         { name: 'teamai-recall', content: TEAMAI_RECALL_RULE_CONTENT },
     ].filter(r => !(options?.skipRecall && r.name === 'teamai-recall'));
 
+    // Built-in rules deploy into auto-discovered tool dirs too; apply the same
+    // ownership protection as built-in skills so a personal same-named rule
+    // (e.g. a hand-written teamai-recall.mdc) is never silently overwritten.
+    const scopedKeys = new Set(Object.keys(scopedToolPaths(teamConfig, localConfig ?? {})));
+    let state: Awaited<ReturnType<typeof loadStateForScope>> | null = null;
+    let stateDirty = false;
+
     for (const [tool, toolPath] of Object.entries(localConfig ? await effectiveToolPaths(teamConfig, localConfig) : scopedToolPaths(teamConfig, localConfig ?? {}))) {
         if (!toolPath.rules) continue;
 
@@ -71,6 +80,10 @@ export async function deployBuiltinRules(
         const rulesDir = path.join(baseDir, toolPath.rules);
         if (!await pathExists(rulesDir)) continue;
 
+        // In an auto-discovered dir, a same-named file may be personal. Ownership
+        // is only consultable with a localConfig (state is scope-bound).
+        const autoDiscovered = !!localConfig && !scopedKeys.has(tool);
+
         try {
             await ensureDir(rulesDir);
 
@@ -79,14 +92,30 @@ export async function deployBuiltinRules(
             const ext = ruleFileExtensionForTool(tool);
             for (const rule of builtinRules) {
                 const destFile = path.join(rulesDir, `${rule.name}${ext}`);
+
+                // Auto-discovered: only overwrite a rule teamai deployed itself.
+                const key = ownershipKey(tool, 'rules', `${rule.name}${ext}`);
+                if (autoDiscovered) {
+                    if (state === null) state = await loadStateForScope(localConfig!);
+                    if (!await mayWriteAutoDiscovered(destFile, key, state)) {
+                        log.warn(`Preserving personal rule ${rule.name} in ${tool} (${destFile}): not deployed by teamai, not overwriting.`);
+                        continue;
+                    }
+                }
+
                 const content = usesCursorMdcRules(tool)
                     ? teamRuleToCursorMdc(rule.content)
                     : rule.content;
                 await writeFile(destFile, content);
                 log.debug(`Deployed built-in rule ${rule.name} → ${tool}`);
+                if (autoDiscovered && state !== null) {
+                    markAutoDiscovered(key, state);
+                    stateDirty = true;
+                }
 
                 // Drop the `.md` copy an older layout left in an `.mdc` rules dir.
-                if (ext !== '.md') {
+                // Never in an auto-discovered dir — that `.md` may be personal.
+                if (ext !== '.md' && !autoDiscovered) {
                     try {
                         await fs.unlink(path.join(rulesDir, `${rule.name}.md`));
                         log.debug(`Removed legacy .md built-in rule ${rule.name} from ${tool}`);
@@ -96,15 +125,18 @@ export async function deployBuiltinRules(
                 }
             }
 
-            // Clean up legacy rules no longer deployed (both extensions)
-            for (const legacyName of LEGACY_RULE_NAMES) {
-                for (const legacyExt of new Set<string>([ext, '.md'])) {
-                    const legacyFile = path.join(rulesDir, `${legacyName}${legacyExt}`);
-                    try {
-                        await fs.unlink(legacyFile);
-                        log.debug(`Removed legacy built-in rule ${legacyName} from ${tool}`);
-                    } catch {
-                        // File doesn't exist — that's fine
+            // Clean up legacy rules no longer deployed (both extensions). Skip in
+            // auto-discovered dirs: a same-named file there may be personal.
+            if (!autoDiscovered) {
+                for (const legacyName of LEGACY_RULE_NAMES) {
+                    for (const legacyExt of new Set<string>([ext, '.md'])) {
+                        const legacyFile = path.join(rulesDir, `${legacyName}${legacyExt}`);
+                        try {
+                            await fs.unlink(legacyFile);
+                            log.debug(`Removed legacy built-in rule ${legacyName} from ${tool}`);
+                        } catch {
+                            // File doesn't exist — that's fine
+                        }
                     }
                 }
             }
@@ -113,6 +145,10 @@ export async function deployBuiltinRules(
         } catch (e) {
             log.error(`Failed to deploy built-in rules to ${tool}: ${(e as Error).message}`);
         }
+    }
+
+    if (stateDirty && state !== null && localConfig) {
+        await saveStateForScope(state, localConfig);
     }
 
     return deployed;

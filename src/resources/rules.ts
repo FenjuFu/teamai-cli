@@ -190,8 +190,9 @@ export class RulesHandler extends ResourceHandler {
 
       // Auto-discovered (non-team-managed) tool: only write if teamai deployed
       // this rule before or nothing is there; a pre-existing untracked rule is
-      // personal — preserve it with a visible notice.
-      const key = ownershipKey(tool, 'rules', item.name);
+      // personal — preserve it with a visible notice. Key by the actual filename
+      // (with extension) so a personal `.md` is never authorized by a `.mdc` record.
+      const key = ownershipKey(tool, 'rules', path.basename(dest));
       if (!scopedKeys.has(tool)) {
         if (state === null) state = await loadStateForScope(localConfig);
         if (!await mayWriteAutoDiscovered(dest, key, state)) {
