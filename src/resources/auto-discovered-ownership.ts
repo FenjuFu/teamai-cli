@@ -45,3 +45,19 @@ export function markAutoDiscovered(key: string, state: State): void {
     state.autoDiscoveredManaged = tracked;
   }
 }
+
+/** True if teamai's record says it deployed `key` into an auto-discovered dir. */
+export function isAutoDiscoveredTracked(key: string, state: State): boolean {
+  return (state.autoDiscoveredManaged ?? []).includes(key);
+}
+
+/** Drop `key` from the ownership record (e.g. after a tombstone cleanup). */
+export function unmarkAutoDiscovered(key: string, state: State): void {
+  const tracked = state.autoDiscoveredManaged;
+  if (!tracked) return;
+  const idx = tracked.indexOf(key);
+  if (idx !== -1) {
+    tracked.splice(idx, 1);
+    state.autoDiscoveredManaged = tracked;
+  }
+}

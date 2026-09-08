@@ -7,6 +7,10 @@ vi.mock('../config.js', () => ({
   requireInit: vi.fn(),
   loadState: vi.fn(),
   saveState: vi.fn(),
+  // Ownership record lookup for auto-discovered built-in skill deployment.
+  // Empty record → a pre-existing personal skill is untracked → preserved.
+  loadStateForScope: vi.fn().mockResolvedValue({ autoDiscoveredManaged: [] }),
+  saveStateForScope: vi.fn(),
 }));
 
 vi.mock('../utils/git.js', () => ({
@@ -489,6 +493,50 @@ describe('deployBuiltinSkills — skip uninstalled tools', () => {
     expect(await fse.pathExists(path.join(skillDir, 'SKILL.md'))).toBe(true);
     expect(await fse.pathExists(path.join(skillDir, 'references/methodology/phase0-collection.md'))).toBe(true);
     expect(await fse.pathExists(path.join(skillDir, 'scripts/scan_repo.py'))).toBe(true);
+  });
+
+  it('does not overwrite a personal built-in-named skill in an auto-discovered dir', async () => {
+    const { deployBuiltinSkills } = await import('../builtin-skills.js');
+
+    // gemini installed (auto-discovered) but NOT in toolPaths; a personal skill
+    // occupies a built-in name with unique content.
+    await fse.ensureDir(path.join(homeDir, '.gemini', 'skills', 'team-wiki-codebase'));
+    await fse.writeFile(
+      path.join(homeDir, '.gemini', 'skills', 'team-wiki-codebase', 'SKILL.md'),
+      'PERSONAL WIKI CONTENT',
+    );
+
+    const teamConfig = {
+      team: 'test',
+      description: '',
+      repo: 'https://git.woa.com/test/repo.git',
+      provider: 'tgit' as const,
+      reviewers: [],
+      sharing: {
+        skills: {},
+        rules: { enforced: [] },
+        docs: { localDir: '' },
+        env: { injectShellProfile: true },
+      },
+      toolPaths: {
+        claude: { skills: '.claude/skills' },
+      },
+    };
+    const localConfig = {
+      repo: { localPath: path.join(tmpDir, 'repo'), remote: 'https://git.woa.com/test/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto' as const,
+      additionalRoles: [],
+      scope: 'user' as const,
+    };
+
+    await deployBuiltinSkills(teamConfig, localConfig);
+
+    // Personal skill in the auto-discovered gemini dir is preserved…
+    expect(await fse.readFile(path.join(homeDir, '.gemini/skills/team-wiki-codebase/SKILL.md'), 'utf-8'))
+      .toBe('PERSONAL WIKI CONTENT');
+    // …while claude (team-managed) still receives the real built-in skill.
+    expect(await fse.pathExists(path.join(homeDir, '.claude/skills/team-wiki-codebase/SKILL.md'))).toBe(true);
   });
 
   it('deploys built-in skills to OpenCode user scope under .config/opencode/skills', async () => {

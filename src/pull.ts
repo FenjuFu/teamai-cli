@@ -8,6 +8,7 @@ import { log, spinner } from './utils/logger.js';
 import { pathExists, remove, listFiles, listDirs, readFileSafe } from './utils/fs.js';
 import { injectClaudeMdSection } from './utils/claudemd.js';
 import { getHandler, RulesHandler, DocsHandler, EnvHandler } from './resources/index.js';
+import { ownershipKey, isAutoDiscoveredTracked, unmarkAutoDiscovered } from './resources/auto-discovered-ownership.js';
 import { ResourceHandler } from './resources/base.js';
 import { ruleFileExtensionForTool } from './resources/rule-format.js';
 import { loadTagsConfig, filterByTags } from './utils/tags.js';
@@ -605,6 +606,13 @@ async function pullForScope(
     ];
 
     const baseDir = resolveBaseDir(localConfig);
+    const scopedTombstoneTools = scopedToolPaths(freshConfig, localConfig);
+    const scopedTombstoneKeys = new Set(Object.keys(scopedTombstoneTools));
+    // Ownership record: needed to clean tombstoned resources from AUTO-DISCOVERED
+    // dirs, but only those teamai deployed itself (never a personal same-named
+    // file). Loaded/saved lazily, load-modify-save like the final revision save.
+    let tombstoneState: Awaited<ReturnType<typeof loadStateForScope>> | null = null;
+    let tombstoneStateDirty = false;
     for (const { type, ext, toolPathField } of tombstoneTypes) {
       const handler = getHandler(type);
       const tombstones = await handler.readTombstones(localConfig);
@@ -613,7 +621,7 @@ async function pullForScope(
       // Tombstone cleanup only touches team-managed tools (scopedToolPaths),
       // not auto-discovered ones — a personal skill in ~/.gemini/skills/ that
       // happens to share a name with a tombstoned team skill must not be deleted.
-      for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
+      for (const [tool, toolPath] of Object.entries(scopedTombstoneTools)) {
         const dir = toolPath[toolPathField];
         if (!dir) continue;
         if (!await ResourceHandler.isToolInstalled(dir, baseDir)) continue;
@@ -636,6 +644,41 @@ async function pullForScope(
           }
         }
       }
+
+      // Auto-discovered tools: a team resource teamai deployed there (tracked in
+      // the ownership record) MUST also be withdrawn when the team tombstones it
+      // — otherwise a recalled (possibly dangerous) resource lingers and can
+      // still be loaded. Untracked same-named files are personal — never touched.
+      for (const [tool, toolPath] of Object.entries(await effectiveToolPaths(freshConfig, localConfig))) {
+        if (scopedTombstoneKeys.has(tool)) continue; // team-managed handled above
+        const dir = toolPath[toolPathField];
+        if (!dir) continue;
+        if (!await ResourceHandler.isToolInstalled(dir, baseDir)) continue;
+        if (isAgentDisabled(localConfig, tool)) continue;
+
+        const extensions = type === 'rules'
+          ? [...new Set([ruleFileExtensionForTool(tool), '.md'])]
+          : [ext];
+
+        for (const name of tombstones) {
+          const key = ownershipKey(tool, type, name);
+          if (tombstoneState === null) tombstoneState = await loadStateForScope(localConfig);
+          if (!isAutoDiscoveredTracked(key, tombstoneState)) continue; // personal — keep
+          for (const extension of extensions) {
+            const localPath = path.join(baseDir, dir, extension ? `${name}${extension}` : name);
+            if (await pathExists(localPath)) {
+              await remove(localPath);
+              log.debug(`[${scopeLabel}] Cleaned up tombstoned teamai-deployed ${type} ${name} from auto-discovered ${dir}`);
+            }
+          }
+          unmarkAutoDiscovered(key, tombstoneState);
+          tombstoneStateDirty = true;
+        }
+      }
+    }
+
+    if (tombstoneStateDirty && tombstoneState !== null) {
+      await saveStateForScope(tombstoneState, localConfig);
     }
 
     if (roleContext) {

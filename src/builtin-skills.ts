@@ -9,6 +9,8 @@ import { resolveBaseDir, isAgentDisabled, scopedToolPaths, effectiveToolPaths } 
 import { ResourceHandler } from './resources/base.js';
 import { ensureSkillFrontmatter } from './resources/skills.js';
 import { getUserHome } from './utils/home.js';
+import { loadStateForScope, saveStateForScope } from './config.js';
+import { ownershipKey, mayWriteAutoDiscovered, markAutoDiscovered } from './resources/auto-discovered-ownership.js';
 
 // ─── Built-in skills deployment ──────────────────────────
 //
@@ -107,6 +109,15 @@ export async function deployBuiltinSkills(teamConfig: TeamaiConfig, localConfig?
   const baseDir = localConfig ? resolveBaseDir(localConfig) : getUserHome();
   let deployed = 0;
 
+  // Built-in skills deploy into auto-discovered tool dirs too, so they need the
+  // same personal-resource protection as team resources: in a non-team-managed
+  // tool dir, only overwrite a same-named skill teamai deployed itself (tracked
+  // in state.autoDiscoveredManaged). Ownership is only consultable with a
+  // localConfig (state is scope-bound); without one, keep the legacy behavior.
+  const scopedKeys = new Set(Object.keys(scopedToolPaths(teamConfig, localConfig ?? {})));
+  let state: Awaited<ReturnType<typeof loadStateForScope>> | null = null;
+  let stateDirty = false;
+
   for (const [tool, toolPath] of Object.entries(localConfig ? await effectiveToolPaths(teamConfig, localConfig) : scopedToolPaths(teamConfig, localConfig ?? {}))) {
     if (!toolPath.skills) continue;
 
@@ -118,10 +129,20 @@ export async function deployBuiltinSkills(teamConfig: TeamaiConfig, localConfig?
     if (localConfig && isAgentDisabled(localConfig, tool)) continue;
 
     const targetSkillsDir = path.join(baseDir, toolPath.skills);
+    const autoDiscovered = !!localConfig && !scopedKeys.has(tool);
 
     for (const skillName of skillNames) {
       const srcDir = path.join(builtinDir, skillName);
       const destDir = path.join(targetSkillsDir, skillName);
+
+      const key = ownershipKey(tool, 'skills', skillName);
+      if (autoDiscovered) {
+        if (state === null) state = await loadStateForScope(localConfig!);
+        if (!await mayWriteAutoDiscovered(destDir, key, state)) {
+          log.warn(`Preserving personal skill ${skillName} in ${tool} (${destDir}): not deployed by teamai, not overwriting.`);
+          continue;
+        }
+      }
 
       try {
         await copyBuiltinSkillDir(srcDir, destDir);
@@ -129,11 +150,19 @@ export async function deployBuiltinSkills(teamConfig: TeamaiConfig, localConfig?
         // Ensure SKILL.md has proper YAML frontmatter (name + description)
         await ensureSkillFrontmatter(destDir, skillName);
 
+        if (autoDiscovered && state !== null) {
+          markAutoDiscovered(key, state);
+          stateDirty = true;
+        }
         deployed++;
       } catch (e) {
         log.error(`Failed to deploy built-in skill ${skillName} to ${toolPath.skills}: ${(e as Error).message}`);
       }
     }
+  }
+
+  if (stateDirty && state !== null && localConfig) {
+    await saveStateForScope(state, localConfig);
   }
 
   return deployed;

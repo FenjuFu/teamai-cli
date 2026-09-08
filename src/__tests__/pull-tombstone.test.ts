@@ -473,6 +473,43 @@ describe('pull role-aware sync and cleanup', () => {
       .toBe('PERSONAL RULE CONTENT');
   });
 
+  it('withdraws a teamai-deployed skill from an auto-discovered dir on tombstone (P2 withdrawal)', async () => {
+    await fse.ensureDir(path.join(homeDir, '.gemini', 'skills'));
+    await fse.ensureDir(path.join(repoPath, 'skills', 'hai', 'withdrawn'));
+    await fse.writeFile(
+      path.join(repoPath, 'skills', 'hai', 'withdrawn', 'SKILL.md'),
+      '---\nname: withdrawn\ndescription: to be recalled\n---\nDANGEROUS INSTRUCTION\n',
+    );
+
+    // First pull: teamai deploys `withdrawn` into the auto-discovered gemini dir
+    // and records ownership.
+    await pull({ force: true });
+    expect(await fse.pathExists(path.join(homeDir, '.gemini/skills', 'withdrawn', 'SKILL.md'))).toBe(true);
+
+    // Team recalls it: remove from repo and tombstone it.
+    await fse.remove(path.join(repoPath, 'skills', 'hai', 'withdrawn'));
+    await fse.writeFile(path.join(repoPath, 'skills', '.removed'), 'withdrawn\n');
+
+    // Second pull: the recalled skill must be withdrawn from the auto-discovered
+    // gemini dir too (it was teamai-deployed / tracked), not just from claude.
+    await pull({ force: true });
+    expect(await fse.pathExists(path.join(homeDir, '.gemini/skills', 'withdrawn'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.claude/skills', 'withdrawn'))).toBe(false);
+  });
+
+  it('does NOT delete a personal same-named skill from an auto-discovered dir on tombstone (P2 personal-safe)', async () => {
+    // A personal skill teamai never deployed (no ownership record) that shares a
+    // name with a tombstoned team skill must survive.
+    await fse.ensureDir(path.join(homeDir, '.gemini', 'skills', 'ghost'));
+    await fse.writeFile(path.join(homeDir, '.gemini', 'skills', 'ghost', 'SKILL.md'), 'PERSONAL GHOST');
+    await fse.writeFile(path.join(repoPath, 'skills', '.removed'), 'ghost\n');
+
+    await pull({ force: true });
+
+    expect(await fse.readFile(path.join(homeDir, '.gemini/skills', 'ghost', 'SKILL.md'), 'utf-8'))
+      .toBe('PERSONAL GHOST');
+  });
+
   it('cleans up stale skills after role change (full pull cycle)', async () => {
     // Setup: create skills in all namespaces
     await fse.ensureDir(path.join(repoPath, 'skills', 'common', 'shared-skill'));
