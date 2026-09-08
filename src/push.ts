@@ -1,4 +1,5 @@
 import path from 'node:path';
+import YAML from 'yaml';
 import { autoDetectInit, loadStateForScope, saveStateForScope } from './config.js';
 import { assertNotReadOnly } from './read-only.js';
 import {
@@ -17,6 +18,8 @@ import { scanTeamRepoNamespaces } from './resources/skills.js';
 import type {
   GlobalOptions, ResourceItem, ResourceType, LocalConfig, TeamaiConfig, State,
 } from './types.js';
+import { getDataHome, SYNC_LOCK_FILENAME } from './types.js';
+import { acquireLock, releaseLock } from './update.js';
 import { assertSafePath, assertSafeResourceName, defaultAllowedRoots } from './utils/path-safety.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces } from './roles.js';
 import { askQuestion, askSelection } from './utils/prompt.js';
@@ -258,6 +261,23 @@ export async function push(options: GlobalOptions & { all?: boolean; role?: stri
   // Auto-detect scope: project scope if cwd has project config, else user scope
   const { localConfig, teamConfig } = await autoDetectInit();
   assertNotReadOnly(localConfig, 'teamai push');
+  try {
+    const configContent = await readFileSafe(path.join(localConfig.repo.localPath, 'teamai.yaml'));
+    const rawConfig = configContent === null ? null : YAML.parse(configContent);
+    if (
+      rawConfig
+      && typeof rawConfig === 'object'
+      && !Array.isArray(rawConfig)
+      && Object.prototype.hasOwnProperty.call(rawConfig, 'packages')
+    ) {
+      const { loadPackageManifest } = await import('./pkg/manifest.js');
+      await loadPackageManifest(localConfig.repo.localPath);
+    }
+  } catch (e) {
+    log.error(`Cannot push invalid package declarations: ${(e as Error).message}`);
+    process.exitCode = 1;
+    return;
+  }
 
   // Single-repo mode: knowledge PRs must run in an isolated worktree so the
   // branch/commit/reset never touch the user's active tree. withKnowledgeWorktree
@@ -273,7 +293,23 @@ export async function push(options: GlobalOptions & { all?: boolean; role?: stri
 
     const { withKnowledgeWorktree, EmptyRepoError } = await import('./utils/reports-branch.js');
     try {
-      await withKnowledgeWorktree(localConfig, (wtConfig) => pushCore(wtConfig, teamConfig, options));
+      const activeConfigPath = path.join(localConfig.repo.localPath, 'teamai.yaml');
+      const activeConfig = await readFileSafe(activeConfigPath);
+      const businessRoot = localConfig.repo.businessRepoRoot ?? localConfig.projectRoot;
+      let pendingTeamConfig: string | null = null;
+      if (activeConfig !== null && businessRoot) {
+        const relativeConfigPath = path.relative(businessRoot, activeConfigPath).split(path.sep).join('/');
+        const committed = await getFileContentAtRev(businessRoot, 'HEAD', relativeConfigPath);
+        if (committed === null || committed.toString() !== activeConfig) {
+          pendingTeamConfig = activeConfig;
+        }
+      }
+      await withKnowledgeWorktree(localConfig, async (wtConfig) => {
+        if (pendingTeamConfig !== null) {
+          await writeFile(path.join(wtConfig.repo.localPath, 'teamai.yaml'), pendingTeamConfig);
+        }
+        await pushCore(wtConfig, teamConfig, options, pendingTeamConfig);
+      });
     } catch (e) {
       if (e instanceof EmptyRepoError) {
         log.error(e.message);
@@ -285,13 +321,29 @@ export async function push(options: GlobalOptions & { all?: boolean; role?: stri
     return;
   }
 
-  await pushCore(localConfig, teamConfig, options);
+  // Guard the shared team clone: push resets to clean master, pulls, then
+  // branches/commits/pushes on one clone shared by all worktrees of this repo.
+  // A concurrent pull/push would corrupt it. Unlike pull, push must NOT silently
+  // skip (that would drop the user's changes), so on contention we error out.
+  const syncLock = path.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
+  const locked = await acquireLock(syncLock);
+  if (!locked) {
+    log.error('Another teamai pull/push is in progress for this project. Re-run once it finishes.');
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    await pushCore(localConfig, teamConfig, options);
+  } finally {
+    await releaseLock(syncLock);
+  }
 }
 
 async function pushCore(
   localConfig: LocalConfig,
   teamConfig: TeamaiConfig,
   options: GlobalOptions & { all?: boolean; role?: string },
+  initialPendingTeamConfig: string | null = null,
 ): Promise<void> {
   const selfMode = localConfig.repo.kind === 'self';
   const scopeLabel = localConfig.scope;
@@ -310,7 +362,7 @@ async function pushCore(
   // below does `git reset --hard`, which would silently destroy them. Capture the
   // working-tree content before the reset and restore it after pull, so config edits
   // survive and get committed alongside resources (see gitFiles construction below).
-  let pendingTeamConfig: string | null = null;
+  let pendingTeamConfig: string | null = initialPendingTeamConfig;
   if (!selfMode) {
     const pullSpin = spinner('Pulling latest changes...').start();
     try {
@@ -350,7 +402,7 @@ async function pushCore(
   // Sync team repo updates to local tool directories before scanning.
   // This prevents files changed by teammates from being falsely flagged as "modified".
   try {
-    const state = await loadStateForScope(localConfig.scope, localConfig.projectRoot);
+    const state = await loadStateForScope(localConfig);
     await syncTeamUpdatesToLocal(teamConfig, localConfig, state.lastPullRev);
   } catch (e) {
     log.debug(`Pre-push sync skipped: ${(e as Error).message}`);
@@ -554,7 +606,7 @@ async function pushCore(
   // Resources waiting in an unmerged PR are absent from the default branch, so
   // the scan above flags them as new every single time. Without this check each
   // run opens another duplicate PR.
-  const pushState = await loadStateForScope(localConfig.scope, localConfig.projectRoot);
+  const pushState = await loadStateForScope(localConfig);
   const pruned = await prunePendingPushes(
     localConfig.repo.localPath,
     pushState.pendingPushes,
@@ -562,7 +614,7 @@ async function pushCore(
   );
   pushState.pendingPushes = pruned.pending;
   if (pruned.changed) {
-    await saveStateForScope(pushState, localConfig.scope, localConfig.projectRoot);
+    await saveStateForScope(pushState, localConfig);
   }
   const pendingPushes = pushState.pendingPushes;
 
@@ -762,7 +814,7 @@ async function pushCore(
     if (!ok) {
       // The branch/PR for earlier groups is already on the remote, so their
       // records must survive this failure or the next run would duplicate them.
-      await saveStateForScope(pushState, localConfig.scope, localConfig.projectRoot);
+      await saveStateForScope(pushState, localConfig);
       process.exitCode = 1;
       return;
     }
@@ -783,7 +835,7 @@ async function pushCore(
       state.pushedEnvVars.push(item.name);
     }
   }
-  await saveStateForScope(state, localConfig.scope, localConfig.projectRoot);
+  await saveStateForScope(state, localConfig);
 }
 
 /**

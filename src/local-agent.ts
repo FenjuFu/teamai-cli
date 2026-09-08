@@ -55,6 +55,8 @@ import {
   TEAMAI_CLAUDEMD_END,
   TeamaiConfigSchema,
   managedMcpManifestPath,
+  managedMcpManifestKey,
+  managedMcpWorkspaceId,
   type DashboardEvent,
   type LocalConfig,
   type ManagedMcpManifest,
@@ -72,6 +74,7 @@ const execFileAsync = promisify(execFile);
 const LOCAL_AGENT_DIR = 'local-agent';
 const CONFIG_FILE = 'config.json';
 const MANIFEST_FILE = 'manifest.json';
+const MODEL_MANIFEST_FILE = 'model-manifest.json';
 const REPORTER_ERROR_LOG = 'reporter/errors.jsonl';
 
 /**
@@ -226,6 +229,35 @@ interface LocalAgentCommand {
   };
 }
 
+interface DeliveredModel {
+  provider: string;
+  model_id: string;
+  name: string;
+  base_url: string;
+  api_key: string;
+  max_tokens?: number;
+  context_window?: number;
+}
+
+interface ModelConfigManifest {
+  codebuddy?: Record<string, string>;
+  claudeEnv?: Record<string, string>;
+  /**
+   * model_id → provider for every model this reporter has applied. Claude
+   * stores its gateway as plain ANTHROPIC_* env vars that carry no provider,
+   * so this is the only way to report back the provider the server sent.
+   */
+  providers?: Record<string, string>;
+  providersByAgent?: Record<string, Record<string, string>>;
+}
+
+function modelAgentKind(tool: string | undefined): 'codebuddy' | 'claude' | undefined {
+  const normalized = normalizeAgentType(tool ?? '');
+  if (normalized === 'codebuddy' || normalized === 'codebuddy-internal') return 'codebuddy';
+  if (normalized === 'claude') return 'claude';
+  return undefined;
+}
+
 /**
  * Whether a sync command is recognized-but-unimplemented and must be skipped
  * before dispatch. Matches both the known unimplemented type strings and any
@@ -260,6 +292,10 @@ function getConfigPath(): string {
 
 function getManifestPath(): string {
   return path.join(getLocalAgentHome(), MANIFEST_FILE);
+}
+
+function getModelManifestPath(): string {
+  return path.join(getLocalAgentHome(), MODEL_MANIFEST_FILE);
 }
 
 function getErrorLogPath(): string {
@@ -620,9 +656,17 @@ function createResourceLocalConfig(
   };
 }
 
-function getResourceRepoPath(scope: LocalAgentScope, workspacePath?: string): string {
+async function getResourceRepoPath(scope: LocalAgentScope, workspacePath?: string): Promise<string> {
   if (scope === 'project' && workspacePath) {
-    return path.join(workspacePath, '.teamai', LOCAL_AGENT_DIR, 'resources');
+    // Project resource cache is A1 (per-project) AND per-worktree: the resource
+    // cache (claudemd/skills/rules fragments) is what each worktree installs
+    // independently, and syncClaudemd merges EVERY file in this dir. The partition
+    // data home is shared by all linked worktrees, so the cache must live in a
+    // per-worktree subdir — otherwise worktree B's CLAUDE.md would merge in
+    // worktree A's instructions. Mirror managed-mcp's per-worktree layout.
+    const { resolveDataHomeForScope } = await import('./config.js');
+    const dataHome = await resolveDataHomeForScope('project', workspacePath);
+    return path.join(dataHome, 'workspaces', managedMcpWorkspaceId(workspacePath), LOCAL_AGENT_DIR, 'resources');
   }
   return path.join(getLocalAgentHome(), 'resources', scope);
 }
@@ -731,12 +775,12 @@ function redactSecrets(s: string): string {
  * emit 'close', producing a false timeout even though the command itself finished.
  * Rejects on non-zero exit, termination by signal, or timeout.
  */
-async function execPluginCommand(cmd: string, timeoutMs: number): Promise<void> {
+export async function execPluginCommand(cmd: string, timeoutMs: number): Promise<void> {
   const { spawn } = await import('node:child_process');
   await new Promise<void>((resolve, reject) => {
     const child = process.platform === 'win32'
       ? spawn('cmd', ['/c', cmd], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] })
-      : spawn('/bin/sh', ['-lc', cmd], { stdio: ['ignore', 'ignore', 'pipe'] });
+      : spawn('bash', ['-lc', cmd], { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     let settled = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -1255,29 +1299,117 @@ function collectManifestSlugs(manifest: LocalAgentManifest): { skills: Set<strin
  * Scan the managed-mcp manifest for a given scope and return MCP servers as
  * ReportedResource entries. Only servers tracked in managed-mcp.json (i.e.
  * installed via HTTP distribution) are reported with source = 'enterprise'.
+ *
+ * Results are scoped to the current `tool` so a report never leaks another
+ * tool's MCP inventory. The manifest is keyed by the same key the installer
+ * writes under (see `installMcpServer`): `tool` at user scope, `${tool}:project`
+ * at project scope. `tool` is the raw hook-context value (not run through
+ * normalizeAgentType), matching how the installer keys the manifest.
  */
 async function scanMcpFromManifest(
   scope: 'user' | 'project',
+  tool: string,
   projectRoot?: string,
 ): Promise<ReportedResource[]> {
-  const manifestPath = managedMcpManifestPath(
-    scope === 'project' ? 'project' : 'user',
-    projectRoot,
-  );
-  const manifest = await readJson<ManagedMcpManifest>(manifestPath);
-  if (!manifest || typeof manifest !== 'object') return [];
+  const { resolveDataHomeForScope } = await import('./config.js');
+  const dataHome = await resolveDataHomeForScope(scope, projectRoot);
+
+  // Project scope reads THIS worktree's own manifest file (per-worktree under the
+  // partition; migrates legacy shared records on first read). User scope reads the
+  // single global file. Either way every record in the loaded file belongs to this
+  // scope, so no key filtering is needed.
+  let manifest: ManagedMcpManifest;
+  if (scope === 'project' && projectRoot) {
+    const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
+    ({ manifest } = await loadProjectMcpManifest(dataHome, projectRoot));
+  } else {
+    manifest = (await readJson<ManagedMcpManifest>(managedMcpManifestPath(dataHome))) ?? {};
+  }
+
+  const manifestKey = `${tool}${scope === 'project' ? ':project' : ''}`;
+  const records = manifest[manifestKey];
+  if (!Array.isArray(records)) return [];
 
   const seen = new Set<string>();
   const results: ReportedResource[] = [];
-  for (const records of Object.values(manifest)) {
-    if (!Array.isArray(records)) continue;
-    for (const rec of records) {
-      if (!rec.name || seen.has(rec.name)) continue;
-      seen.add(rec.name);
-      results.push({ slug: rec.name, source: 'enterprise' });
-    }
+  for (const rec of records) {
+    if (!rec.name || seen.has(rec.name)) continue;
+    seen.add(rec.name);
+    results.push({ slug: rec.name, source: 'enterprise' });
   }
   return results.sort((a, b) => a.slug.localeCompare(b.slug));
+}
+
+interface ReportedModel {
+  provider: string;
+  model_id: string;
+  name?: string;
+  source: string;
+}
+
+/**
+ * Scan the models a tool can currently use, as configured on disk. The server
+ * requires both `provider` and `model_id`, so entries that cannot supply them
+ * are dropped rather than reported as incomplete. `source` is derived from the
+ * model manifest, mirroring how skills/rules classify enterprise vs local.
+ *
+ * Only CodeBuddy and Claude keep a discoverable model config; every other tool
+ * reports nothing. User-owned models are omitted: the backend cannot resolve
+ * them, so only entries still matching a TeamAI delivery are reported.
+ */
+async function scanModelsFromDisk(tool: string): Promise<ReportedModel[]> {
+  const manifest = (await readJson<ModelConfigManifest>(getModelManifestPath())) ?? {};
+  const agentKind = modelAgentKind(tool);
+  const providers = (agentKind && manifest.providersByAgent?.[agentKind]) ?? manifest.providers ?? {};
+
+  if (agentKind === 'codebuddy') {
+    const doc = await readJson<{ models?: unknown }>(
+      path.join(getUserHome(), '.codebuddy', 'models.json'),
+    );
+    const entries = Array.isArray(doc?.models) ? doc.models : [];
+    const owned = manifest.codebuddy ?? {};
+    const results: ReportedModel[] = [];
+    for (const entry of entries) {
+      if (typeof entry !== 'object' || entry === null) continue;
+      const { id, vendor, name } = entry as Record<string, unknown>;
+      if (typeof id !== 'string' || !id) continue;
+      if (typeof vendor !== 'string' || !vendor) continue;
+      // CodeBuddy may normalize a model entry by adding capability metadata.
+      // The manifest's model id is the durable proof that TeamAI delivered it;
+      // requiring an exact object hash would incorrectly hide such entries.
+      if (owned[id] === undefined || providers[id] !== vendor) continue;
+      results.push({
+        provider: vendor,
+        model_id: id,
+        ...(typeof name === 'string' && name ? { name } : {}),
+        source: 'enterprise',
+      });
+    }
+    return results;
+  }
+
+  if (agentKind === 'claude') {
+    const settings = await readJson<{ env?: unknown }>(
+      path.join(getUserHome(), '.claude', 'settings.json'),
+    );
+    const env = settings?.env;
+    if (typeof env !== 'object' || env === null || Array.isArray(env)) return [];
+    const { ANTHROPIC_CUSTOM_MODEL_OPTION: modelId, ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: name } =
+      env as Record<string, unknown>;
+    if (typeof modelId !== 'string' || !modelId) return [];
+    const managed = manifest.claudeEnv?.ANTHROPIC_CUSTOM_MODEL_OPTION;
+    if (managed === undefined || entryHash(modelId) !== managed) return [];
+    const provider = providers[modelId];
+    if (!provider) return [];
+    return [{
+      provider,
+      model_id: modelId,
+      ...(typeof name === 'string' && name ? { name } : {}),
+      source: 'enterprise',
+    }];
+  }
+
+  return [];
 }
 
 /**
@@ -1389,8 +1521,12 @@ export async function buildReportPayload(
   const userLevel: Record<string, unknown> = { group_id: config.userGroupId };
   if (userScope.skills.length > 0) userLevel.skills = userScope.skills;
   if (userScope.rules.length > 0) userLevel.rules = userScope.rules;
-  const userMcps = await scanMcpFromManifest('user');
+  const userMcps = await scanMcpFromManifest('user', tool);
   if (userMcps.length > 0) userLevel.mcps = userMcps;
+  // Omitted when empty for the same full-sync reason as skills/rules: the
+  // server treats a present array as a snapshot, so [] would wipe the models.
+  const userModels = await scanModelsFromDisk(tool);
+  if (userModels.length > 0) userLevel.models = userModels;
 
   const payload: Record<string, unknown> = {
     agent_type: normalizeAgentType(tool),
@@ -1423,7 +1559,7 @@ export async function buildReportPayload(
         };
         if (wsScope.skills.length > 0) workspace.skills = wsScope.skills;
         if (wsScope.rules.length > 0) workspace.rules = wsScope.rules;
-        const wsMcps = await scanMcpFromManifest('project', wsPath);
+        const wsMcps = await scanMcpFromManifest('project', tool, wsPath);
         if (wsMcps.length > 0) workspace.mcps = wsMcps;
         return workspace;
       }),
@@ -1697,8 +1833,12 @@ async function installDownloadedResource(input: {
     throw new Error(`Missing download_url for ${input.command.type ?? 'install_skill'}`);
   }
 
-  const repoPath = getResourceRepoPath(input.scope, input.workspacePath);
-  if (input.scope === 'project' && input.workspacePath) {
+  const repoPath = await getResourceRepoPath(input.scope, input.workspacePath);
+  if (input.scope === 'project' && input.workspacePath
+      && repoPath.startsWith(path.join(input.workspacePath, '.teamai') + path.sep)) {
+    // Only gitignore when the cache actually lands inside the workspace (a legacy,
+    // un-migrated install). A partitioned install keeps it under ~/.teamai, so
+    // there is nothing in the workspace to ignore.
     await ensureProjectGitignore(input.workspacePath);
   }
   await ensureDir(repoPath);
@@ -1801,7 +1941,7 @@ async function uninstallResource(input: {
   workspacePath?: string;
   tool?: string;
 }): Promise<void> {
-  const repoPath = getResourceRepoPath(input.scope, input.workspacePath);
+  const repoPath = await getResourceRepoPath(input.scope, input.workspacePath);
   const fullTeamConfig = createLocalAgentTeamConfig(input.config.endpoint);
   const tool = input.tool ?? 'workbuddy';
   const toolPath = fullTeamConfig.toolPaths[tool];
@@ -1953,6 +2093,276 @@ async function ackCommand(
       version,
     }),
   });
+}
+
+function requireModelString(
+  value: unknown,
+  field: keyof Pick<DeliveredModel, 'provider' | 'model_id' | 'name' | 'base_url' | 'api_key'>,
+): string {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`apply_model_config: ${field} must be a non-empty string`);
+  }
+  return value.trim();
+}
+
+/** CodeBuddy maxOutputTokens when the backend omits max_tokens or sends 0 (Go zero value). */
+const DEFAULT_MAX_TOKENS = 4096;
+
+function optionalPositiveInteger(value: unknown, field: 'max_tokens' | 'context_window'): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const normalized = typeof value === 'string' && /^\d+$/.test(value)
+    ? Number(value)
+    : value;
+  if (!Number.isSafeInteger(normalized) || (normalized as number) < 0) {
+    throw new Error(`apply_model_config: ${field} must be a positive integer`);
+  }
+  // 0 is the Go zero value for an unset int, not a real output/context cap.
+  if ((normalized as number) === 0) return undefined;
+  return normalized as number;
+}
+
+function parseDeliveredModels(raw: string | undefined): { models: DeliveredModel[]; fullSnapshot: boolean } {
+  if (!raw) throw new Error('apply_model_config: missing cmd');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('apply_model_config: cmd must be valid JSON');
+  }
+  const fullSnapshot = (
+    typeof parsed === 'object' &&
+    parsed !== null &&
+    'models' in parsed
+  );
+  const values = fullSnapshot ? (parsed as { models?: unknown }).models : [parsed];
+  if (!Array.isArray(values)) {
+    throw new Error('apply_model_config: models must be an array');
+  }
+
+  const seen = new Set<string>();
+  const models = values.map((value) => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error('apply_model_config: each model must be an object');
+    }
+    const input = value as Record<string, unknown>;
+    const model: DeliveredModel = {
+      provider: requireModelString(input.provider, 'provider'),
+      model_id: requireModelString(input.model_id, 'model_id'),
+      name: requireModelString(input.name, 'name'),
+      base_url: requireModelString(input.base_url, 'base_url'),
+      api_key: requireModelString(input.api_key, 'api_key'),
+      max_tokens: optionalPositiveInteger(input.max_tokens, 'max_tokens') ?? DEFAULT_MAX_TOKENS,
+      context_window: optionalPositiveInteger(input.context_window, 'context_window'),
+    };
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(model.base_url);
+    } catch {
+      throw new Error('apply_model_config: base_url must be a valid URL');
+    }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      throw new Error('apply_model_config: base_url must use http or https');
+    }
+    if (seen.has(model.model_id)) {
+      throw new Error(`apply_model_config: duplicate model_id "${model.model_id}"`);
+    }
+    seen.add(model.model_id);
+    return model;
+  });
+  return { models, fullSnapshot };
+}
+
+function codebuddyModelEntry(model: DeliveredModel): Record<string, unknown> {
+  const baseUrl = model.base_url.replace(/\/+$/, '');
+  return {
+    id: model.model_id,
+    name: model.name,
+    vendor: model.provider,
+    apiKey: model.api_key,
+    ...(model.context_window === undefined ? {} : { maxInputTokens: model.context_window }),
+    ...(model.max_tokens === undefined ? {} : { maxOutputTokens: model.max_tokens }),
+    url: baseUrl.endsWith('/chat/completions') ? baseUrl : `${baseUrl}/chat/completions`,
+    supportsToolCall: true,
+  };
+}
+
+async function readJsonObject(filePath: string): Promise<Record<string, unknown>> {
+  const source = await readFileSafe(filePath);
+  if (source === null) return {};
+  try {
+    const parsed = JSON.parse(source);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('root must be an object');
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(`apply_model_config: cannot parse ${filePath}: ${(error as Error).message}`);
+  }
+}
+
+/** Atomically update a model dotfile without replacing a user-managed symlink. */
+async function writeModelJson(filePath: string, data: unknown): Promise<void> {
+  let targetPath = filePath;
+  try {
+    if ((await fs.promises.lstat(filePath)).isSymbolicLink()) {
+      targetPath = await fs.promises.realpath(filePath);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  // Set the temp file's mode before the atomic rename. A post-rename chmod
+  // would introduce a symlink-following TOCTOU window.
+  await writeJsonAtomic(targetPath, data, { mode: 0o600 });
+}
+
+async function reconcileCodebuddyModels(
+  models: DeliveredModel[],
+  fullSnapshot: boolean,
+  manifest: ModelConfigManifest,
+): Promise<void> {
+  const targetFile = path.join(getUserHome(), '.codebuddy', 'models.json');
+  const doc = await readJsonObject(targetFile);
+  const existing = doc.models === undefined ? [] : doc.models;
+  if (!Array.isArray(existing)) {
+    throw new Error(`apply_model_config: models must be an array in ${targetFile}`);
+  }
+
+  const previouslyManaged = manifest.codebuddy ?? {};
+  const nextManaged: Record<string, string> = fullSnapshot ? {} : { ...previouslyManaged };
+  const incomingIds = new Set(models.map((model) => model.model_id));
+  const removedManaged = new Set<string>();
+  const preserved: unknown[] = [];
+  const occupiedIds = new Set<string>();
+  for (const entry of existing) {
+    const id = typeof entry === 'object' && entry !== null && typeof (entry as { id?: unknown }).id === 'string'
+      ? (entry as { id: string }).id
+      : undefined;
+    if (id && previouslyManaged[id] && entryHash(entry) === previouslyManaged[id]) {
+      if (fullSnapshot || incomingIds.has(id)) {
+        removedManaged.add(id);
+        continue;
+      }
+      preserved.push(entry);
+      occupiedIds.add(id);
+      continue;
+    }
+    preserved.push(entry);
+    if (id) occupiedIds.add(id);
+    if (id && previouslyManaged[id]) delete nextManaged[id];
+  }
+
+  for (const model of models) {
+    if (occupiedIds.has(model.model_id)) continue;
+    const entry = codebuddyModelEntry(model);
+    preserved.push(entry);
+    nextManaged[model.model_id] = entryHash(entry);
+  }
+  doc.models = preserved;
+
+  if (Array.isArray(doc.availableModels) && doc.availableModels.length > 0) {
+    const available = doc.availableModels.filter(
+      (id): id is string => typeof id === 'string' && !removedManaged.has(id),
+    );
+    for (const id of Object.keys(nextManaged)) {
+      if (!available.includes(id)) available.push(id);
+    }
+    doc.availableModels = available;
+  }
+
+  await writeModelJson(targetFile, doc);
+  manifest.codebuddy = nextManaged;
+}
+
+function claudeEnvForModel(model: DeliveredModel): Record<string, string> {
+  const baseUrl = model.base_url.replace(/\/+$/, '').replace(/\/v1$/, '');
+  return {
+    ANTHROPIC_BASE_URL: baseUrl,
+    ANTHROPIC_AUTH_TOKEN: model.api_key,
+    ANTHROPIC_CUSTOM_MODEL_OPTION: model.model_id,
+    ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: model.name,
+  };
+}
+
+async function reconcileClaudeModels(
+  models: DeliveredModel[],
+  manifest: ModelConfigManifest,
+): Promise<void> {
+  const settingsPath = path.join(getUserHome(), '.claude', 'settings.json');
+  const profilePath = path.join(getUserHome(), '.claude', 'teamai-models.json');
+  const previousHashes = manifest.claudeEnv ?? {};
+  const settings = await readJsonObject(settingsPath);
+  const rawEnv = settings.env === undefined ? {} : settings.env;
+  if (typeof rawEnv !== 'object' || rawEnv === null || Array.isArray(rawEnv)) {
+    throw new Error(`apply_model_config: env must be an object in ${settingsPath}`);
+  }
+  const env = { ...(rawEnv as Record<string, unknown>) };
+
+  if (models.length === 0) {
+    const canRemoveGateway = Object.entries(previousHashes).every(
+      ([key, hash]) => entryHash(env[key]) === hash,
+    );
+    if (canRemoveGateway && Object.keys(previousHashes).length > 0) {
+      for (const key of Object.keys(previousHashes)) delete env[key];
+      settings.env = env;
+      await writeModelJson(settingsPath, settings);
+    }
+    await remove(profilePath);
+    manifest.claudeEnv = {};
+    return;
+  }
+
+  // Claude supports one active custom gateway in settings. The first model
+  // seeds that gateway; other candidates remain discoverable from its
+  // /v1/models endpoint when the gateway implements model discovery.
+  const desired = claudeEnvForModel(models[0]);
+  await writeModelJson(profilePath, { env: desired });
+
+  const conflictKeys = new Set([
+    ...Object.keys(desired),
+    'ANTHROPIC_API_KEY',
+  ]);
+  const canManage = [...conflictKeys].every((key) => (
+    env[key] === undefined ||
+    (previousHashes[key] !== undefined && entryHash(env[key]) === previousHashes[key])
+  ));
+  if (!canManage) {
+    manifest.claudeEnv = {};
+    return;
+  }
+
+  for (const [key, hash] of Object.entries(previousHashes)) {
+    if (entryHash(env[key]) === hash) delete env[key];
+  }
+  Object.assign(env, desired);
+  settings.env = env;
+  await writeModelJson(settingsPath, settings);
+  manifest.claudeEnv = Object.fromEntries(
+    Object.entries(desired).map(([key, value]) => [key, entryHash(value)]),
+  );
+}
+
+async function applyModelConfig(command: LocalAgentCommand, tool: string | undefined): Promise<void> {
+  const { models, fullSnapshot } = parseDeliveredModels(command.cmd);
+  const manifest = (await readJson<ModelConfigManifest>(getModelManifestPath())) ?? {};
+  const agentKind = modelAgentKind(tool);
+  if (!agentKind) {
+    throw new Error(`apply_model_config: unsupported agent "${tool ?? ''}"`);
+  }
+  const previousProviders = manifest.providersByAgent?.[agentKind] ?? manifest.providers ?? {};
+  const providers = {
+    ...(fullSnapshot ? {} : previousProviders),
+    ...Object.fromEntries(models.map((model) => [model.model_id, model.provider])),
+  };
+  manifest.providersByAgent = {
+    ...manifest.providersByAgent,
+    [agentKind]: providers,
+  };
+  if (agentKind === 'codebuddy') {
+    await reconcileCodebuddyModels(models, fullSnapshot, manifest);
+  } else {
+    await reconcileClaudeModels(models, manifest);
+  }
+  await writeJsonAtomic(getModelManifestPath(), manifest);
 }
 
 /**
@@ -2265,12 +2675,21 @@ async function installMcpServer(
   const baseDir = projectScope && workspacePath ? workspacePath : getUserHome();
   const targetFile = path.join(baseDir, mcpRel);
 
-  const manifestPath = managedMcpManifestPath(
-    projectScope ? 'project' : 'user',
-    projectScope ? workspacePath : undefined,
-  );
-  const manifest = (await readJson<ManagedMcpManifest>(manifestPath)) ?? {};
-  const manifestKey = `${tool}${projectScope ? ':project' : ''}`;
+  const { resolveDataHomeForScope } = await import('./config.js');
+  const dataHome = await resolveDataHomeForScope(projectScope ? 'project' : 'user', projectScope ? workspacePath : undefined);
+  // Project scope uses THIS worktree's own manifest file (per-worktree under the
+  // partition; migrates legacy shared records on first read). User scope uses the
+  // single global file. The ownership key needs no workspace segment.
+  let manifestPath: string;
+  let manifest: ManagedMcpManifest;
+  if (projectScope && workspacePath) {
+    const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
+    ({ manifestPath, manifest } = await loadProjectMcpManifest(dataHome, workspacePath));
+  } else {
+    manifestPath = managedMcpManifestPath(dataHome);
+    manifest = (await readJson<ManagedMcpManifest>(manifestPath)) ?? {};
+  }
+  const manifestKey = managedMcpManifestKey(tool, projectScope);
   const owned = manifest[manifestKey] ?? [];
   const ownedNames = new Set(owned.map((r: ManagedMcpRecord) => r.name));
 
@@ -2328,12 +2747,21 @@ async function uninstallMcpServer(
   const baseDir = projectScope && workspacePath ? workspacePath : getUserHome();
   const targetFile = path.join(baseDir, mcpRel);
 
-  const manifestPath = managedMcpManifestPath(
-    projectScope ? 'project' : 'user',
-    projectScope ? workspacePath : undefined,
-  );
-  const manifest = (await readJson<ManagedMcpManifest>(manifestPath)) ?? {};
-  const manifestKey = `${tool}${projectScope ? ':project' : ''}`;
+  const { resolveDataHomeForScope } = await import('./config.js');
+  const dataHome = await resolveDataHomeForScope(projectScope ? 'project' : 'user', projectScope ? workspacePath : undefined);
+  // Project scope uses THIS worktree's own manifest file (per-worktree under the
+  // partition; migrates legacy shared records on first read). User scope uses the
+  // single global file. The ownership key needs no workspace segment.
+  let manifestPath: string;
+  let manifest: ManagedMcpManifest;
+  if (projectScope && workspacePath) {
+    const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
+    ({ manifestPath, manifest } = await loadProjectMcpManifest(dataHome, workspacePath));
+  } else {
+    manifestPath = managedMcpManifestPath(dataHome);
+    manifest = (await readJson<ManagedMcpManifest>(manifestPath)) ?? {};
+  }
+  const manifestKey = managedMcpManifestKey(tool, projectScope);
   const owned = manifest[manifestKey] ?? [];
   const ownedNames = new Set(owned.map((r: ManagedMcpRecord) => r.name));
 
@@ -2395,6 +2823,10 @@ async function executeCommand(
   command: LocalAgentCommand,
   context: LocalAgentContext,
 ): Promise<string | undefined> {
+  if (command.type === 'apply_model_config') {
+    await applyModelConfig(command, context.tool);
+    return;
+  }
   // uninstall_teamai (clawpro three-phase: cmd = "teamai uninstall --force
   // --agent <tool>") executes its `cmd` string as a restricted teamai subcommand.
   if (command.type === 'uninstall_teamai') {
@@ -2434,21 +2866,34 @@ async function processCommands(
   config: LocalAgentConfig,
   commands: LocalAgentCommand[],
   context: LocalAgentContext,
-): Promise<void> {
+): Promise<boolean> {
   const tag = localAgentTag(context);
+  let modelConfigApplied = false;
   for (const command of commands) {
-    if (isUnimplementedCommand(command)) {
+    // Keep these special types aligned with executeCommand's direct branches.
+    // Resource commands are recognized generically by commandKind/action;
+    // everything else is a future protocol extension and must be skipped.
+    if (isUnimplementedCommand(command) || (
+      command.type !== 'apply_model_config' &&
+      command.type !== 'uninstall_teamai' &&
+      command.type !== 'install_hook_rule' &&
+      command.type !== 'uninstall_hook_rule' &&
+      command.type !== 'install_mcp' &&
+      command.type !== 'uninstall_mcp' &&
+      (!commandKind(command) || !commandAction(command))
+    )) {
       log.debug(`${tag} skipping unimplemented command ${command.id} (${command.type})`);
       continue;
     }
     try {
       const version = await executeCommand(config, command, context);
       await ackCommand(config, tag, command, 'success', version);
+      if (command.type === 'apply_model_config') modelConfigApplied = true;
       log.debug(`${tag} command ${command.id} (${command.type ?? ''}) succeeded`);
       // Uninstall succeeded — skip remaining commands; the hook process exits naturally.
       if (command.type === 'uninstall_teamai') {
         log.debug(`${tag} uninstall_teamai completed — remaining commands skipped`);
-        return;
+        return modelConfigApplied;
       }
     } catch (e) {
       const error = (e as Error).message;
@@ -2460,6 +2905,7 @@ async function processCommands(
       }
     }
   }
+  return modelConfigApplied;
 }
 
 export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promise<boolean> {
@@ -2541,6 +2987,7 @@ export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promi
       tag,
       'sync',
       { method: 'POST', body: JSON.stringify(syncPayload) },
+      { redactResponseLog: true },
     );
     // Prefer the unified cmds[] (source of truth). Fall back to the legacy
     // commands[] for older backends that do not yet emit cmds. An empty cmds[]
@@ -2553,7 +3000,15 @@ export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promi
     const commands = cmds && cmds.length > 0 ? cmds : (syncResponse.commands ?? []);
     if (commands.length > 0) {
       log.debug(`${tag} sync returned ${commands.length} command(s): ${commands.map((c) => `${c.type}#${c.id}`).join(', ')}`);
-      await processCommands(config, commands, context);
+      const modelConfigApplied = await processCommands(config, commands, context);
+      if (modelConfigApplied && !skipReport) {
+        const reportPayload = await buildReportPayload(config, context);
+        await localAgentFetch(config, tag, 'report', {
+          method: 'POST',
+          body: JSON.stringify(reportPayload),
+        });
+        log.debug(`${tag} model config report OK`);
+      }
     }
     log.debug(`${tag} sync OK (${commands.length} command(s))`);
   } catch (e) {

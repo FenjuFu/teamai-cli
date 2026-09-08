@@ -19,6 +19,22 @@ export function createGit(basePath?: string): SimpleGit {
 }
 
 /**
+ * Commit TeamAI makes in a managed checkout (knowledge-wt, reports-wt, or a
+ * dedicated team-repo PR branch created by {@link pushRepoBranch}).
+ *
+ * Isolated worktrees are based on origin/<default> and often have tracked hook
+ * scripts (e.g. `.husky/pre-commit`) without the locally generated `husky.sh`
+ * (`HUSKY=0` lives inside that file, so it cannot save the commit). Those
+ * commits only add knowledge or report files and must not run lint-staged.
+ *
+ * `--no-verify` is scoped to this git process. It does not write
+ * `core.hooksPath` and does not change the user's ordinary `git commit`.
+ */
+export function commitSkippingHooks(git: SimpleGit, message: string) {
+  return git.commit(message, { '--no-verify': null });
+}
+
+/**
  * Check whether localPath is a valid git repository (has a `.git` entry).
  *
  * Returns false if the path does not exist, or exists but is not a git repo
@@ -516,8 +532,9 @@ export async function pushRepoBranch(
     return false;
   }
 
-  // Commit and push branch
-  await git.commit(message);
+  // Commit and push branch. Skip hooks: this is a CLI-managed knowledge commit
+  // (often inside knowledge-wt, which has hook scripts but no husky.sh).
+  await commitSkippingHooks(git, message);
 
   if (opts.reuseBranch) {
     // Re-running push with no real change would otherwise force-push an
@@ -725,6 +742,32 @@ export async function resolveAnchors(cwd?: string): Promise<ProjectAnchors | nul
   } catch {
     return null;
   }
+}
+
+/**
+ * List the realpath'd top-level directory of every worktree of the repo that
+ * contains `cwd` (main checkout + all linked worktrees), from
+ * `git worktree list --porcelain`. Returns [] outside a git repo. Used by a
+ * project-wide uninstall to clean each worktree's managed resources before the
+ * shared partition is deleted (issue #374 P1-2C).
+ */
+export async function listWorktrees(cwd?: string): Promise<string[]> {
+  const git = createGit(cwd);
+  let list: string;
+  try {
+    list = await git.raw(['worktree', 'list', '--porcelain']);
+  } catch {
+    return [];
+  }
+  const roots = list
+    .split('\n')
+    .filter((l) => l.startsWith('worktree '))
+    .map((l) => l.slice('worktree '.length).trim())
+    .filter(Boolean);
+  const resolved = await Promise.all(
+    roots.map((r) => realpath(r).catch(() => r)),
+  );
+  return Array.from(new Set(resolved));
 }
 
 /**

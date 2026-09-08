@@ -17,7 +17,7 @@
  */
 import path from 'node:path';
 import fse from 'fs-extra';
-import { createGit, isGitRepo, getDefaultBranch, hasCommits } from './git.js';
+import { createGit, isGitRepo, getDefaultBranch, hasCommits, commitSkippingHooks } from './git.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { ensureDir, writeFile, pathExists } from './fs.js';
 import { log } from './logger.js';
@@ -75,7 +75,19 @@ async function remoteBranchExists(repoRoot: string): Promise<boolean> {
  *  - remote branch exists      → worktree add --track -b from origin/teamai-reports.
  *  - remote branch absent      → create the orphan branch locally, then first-push.
  */
-export async function ensureReportsWorktree(localConfig: LocalConfig): Promise<string> {
+export interface EnsureReportsWorktreeOptions {
+  /**
+   * Whether a cold start may publish a newly created reports branch. Writers
+   * keep the default; read-only callers can materialize a local view without
+   * changing origin.
+   */
+  pushIfCreated?: boolean;
+}
+
+export async function ensureReportsWorktree(
+  localConfig: LocalConfig,
+  options: EnsureReportsWorktreeOptions = {},
+): Promise<string> {
   const wt = reportsWorktreePath(localConfig);
   const repoRoot = businessRoot(localConfig);
 
@@ -119,11 +131,13 @@ export async function ensureReportsWorktree(localConfig: LocalConfig): Promise<s
     await writeWorktreeGitignore(wt);
     const wtGit = createGit(wt);
     await wtGit.add(['.gitignore']);
-    await wtGit.commit('[teamai] Initialize reports branch');
-    try {
-      await wtGit.push(['-u', 'origin', REPORTS_BRANCH]);
-    } catch (e) {
-      log.debug(`[reports] initial push skipped: ${(e as Error).message}`);
+    await commitSkippingHooks(wtGit, '[teamai] Initialize reports branch');
+    if (options.pushIfCreated !== false) {
+      try {
+        await wtGit.push(['-u', 'origin', REPORTS_BRANCH]);
+      } catch (e) {
+        log.debug(`[reports] initial push skipped: ${(e as Error).message}`);
+      }
     }
   }
 
@@ -220,7 +234,7 @@ export async function commitAndPushReports(
       return false;
     }
 
-    await git.commit(message);
+    await commitSkippingHooks(git, message);
 
     // Push with fetch+rebase retry. Each member only writes <user>.yaml, so
     // rebase conflicts are effectively impossible; retries handle the pure
@@ -262,9 +276,12 @@ export async function commitAndPushReports(
  * (digest/members/stats) see other members' latest data. Safe: only touches the
  * orphan-branch worktree, never the active tree.
  */
-export async function refreshReportsWorktree(localConfig: LocalConfig): Promise<void> {
+export async function refreshReportsWorktree(
+  localConfig: LocalConfig,
+  options: EnsureReportsWorktreeOptions = {},
+): Promise<void> {
   try {
-    const wt = await ensureReportsWorktree(localConfig);
+    const wt = await ensureReportsWorktree(localConfig, options);
     const git = createGit(wt);
     await git.fetch(['origin', REPORTS_BRANCH]);
     await git.raw(['reset', '--hard', `origin/${REPORTS_BRANCH}`]);

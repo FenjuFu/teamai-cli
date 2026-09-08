@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/teamai-cli-logo.svg" alt="teamai-cli" width="430">
+  <img src="assets/teamai-cli-logo.svg" alt="teamai-cli">
 </p>
 
-# TeamAI — The team harness for AI agents
+# TeamAI — Make Every Team AI Native
 
 > [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -11,9 +11,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/teamai-cli.svg)](https://www.npmjs.com/package/teamai-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-面向 AI 智能体的团队 Harness 管理和分发工具。
-
-通过 Git 统一管理 skills、rules、mcp、环境变量、知识库等 Harness，驾驭 Claude Code / Codex / CodeBuddy / WorkBuddy / OpenCode 等多种 AI 工具。
+TeamAI 统一管理团队的 Skills、Rules、MCP 和知识，驾驭 Claude Code、Codex、CodeBuddy、WorkBuddy、OpenCode、Cursor 等 AI Agents。
 
 ## 快速开始
 
@@ -46,15 +44,25 @@ teamai init https://github.com/yourorg/yourrepo --scope user
 
 > **完整使用指南**：[docs/usage-guide.zh-CN.md](docs/usage-guide.zh-CN.md)（[English](docs/usage-guide.md)）— 涵盖从团队创建到日常使用的全流程。
 
+## 产品架构
+
+**Team Execution × Team Context × Team Improvement**：
+
+| 层 | 要解决的问题 | 当前 CLI 中的体现 |
+|----|--------------|-------------------|
+| **Team Execution** | 让每个 Agent 按团队的方式工作 | `init` / `pull` / `push`，skills、rules、agents、hooks、MCP、env |
+| **Team Context** | 让每个 Agent 理解整个团队 | recall、learnings、代码知识图谱、teamwiki... |
+| **Team Improvement** | 让每一次执行都成为团队能力的积累 | 基于摩擦信号的经验分享、sessions、digest、dashboard... |
+
 ## 功能概览
 
 <table>
   <thead>
     <tr>
       <th rowspan="2">Agent</th>
-      <th colspan="7">Harness</th>
-      <th colspan="3">知识库</th>
-      <th colspan="3">使用分析</th>
+      <th colspan="7">Team Execution</th>
+      <th colspan="3">Team Context</th>
+      <th colspan="3">Team Improvement</th>
     </tr>
     <tr>
       <th>skills</th><th>rules</th><th>docs</th><th>env</th><th>agents</th><th>hooks</th><th>mcp</th>
@@ -67,11 +75,12 @@ teamai init https://github.com/yourorg/yourrepo --scope user
     <tr><td>Codex</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
     <tr><td>Cursor</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
     <tr><td>CodeBuddy</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
-    <tr><td>OpenCode</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
     <tr><td>WorkBuddy</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
+    <tr><td>OpenCode</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
     <tr><td>OpenClaw</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
     <tr><td>Hermes</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
     <tr><td>DeepSeek Harness</td><td align="center">✓</td><td align="center">—</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">—</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">—</td><td align="center">—</td><td align="center">—</td></tr>
+    <tr><td>Qoder</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td><td align="center">✓</td></tr>
   </tbody>
 </table>
 
@@ -87,18 +96,9 @@ teamai init https://github.com/yourorg/yourrepo --scope user
 | **标签（Tags）** | `teamai tags` | 给 skills / rules 打标签，成员只订阅自己需要的标签。 |
 | **订阅源（Sources）** | `teamai source` | 订阅额外的 skill 仓库——其他团队的公开仓库，或本团队内的公共/共享仓库；已订阅的 skills 会在 pull 时自动同步。 |
 
-### 使用分析
+## Team Execution
 
-洞察团队实际如何使用 AI 工具：
-
-| 能力 | 命令 | 呈现内容 |
-|------|------|----------|
-| **用量（Usage）** | `teamai digest` | 团队周报——token 用量、会话量、干预率。 |
-| **会话（Sessions）** | `teamai session save` | 脱敏的单会话摘要（工具序列、对话轮次、干预次数），喂给周报的 Session Highlights。 |
-| **看板（Dashboard）** | `teamai dashboard` | Web 看板，实时展示成员的编码会话状态、干预次数和 token 用量。 |
-| **知识库健康（KB Health）** | `teamai dashboard` → KB Health | 内置于看板的报告页面，展示知识库使用情况与健康状态——各类型覆盖率、高频召回条目、沉默条目、召回趋势、作者贡献及维护控制台。 |
-
-## Harness 管理和分发
+> One Team. One Harness. Every Agent.
 
 TeamAI 把 skills、rules、docs、hooks 统一存放在共享 Git 仓库，通过「push → 评审合并 → pull」的流程分发到每位成员的本地 AI 工具，并支持订阅其他团队或公共仓库的 Harness。
 
@@ -163,7 +163,23 @@ teamai source remove other-team
 添加/移除会立即在本机生效，订阅的 skills 会在下一次 `teamai pull` 时同步。需要将
 `teamai.yaml` 的改动分享给团队成员时，再运行 `teamai push`。
 
-## 知识库
+### 团队包
+
+共享并一键恢复团队的 npm 包和 Claude Code 插件：
+
+```bash
+teamai packages install typescript
+teamai packages install typescript@5.9.2 --npm
+teamai packages install code-review@claude-plugins-official
+teamai push       # 分享团队声明
+teamai packages    # 安装团队声明的全部包
+```
+
+完整工作流和配置见[使用指南](docs/usage-guide.zh-CN.md#团队包)。
+
+## Team Context
+
+> Every agent understands how the team works.
 
 除了分发 Harness，TeamAI 还把团队沉淀的经验和代码结构组织成可检索的知识库，让 AI 在需要时自动召回。
 
@@ -179,7 +195,7 @@ Task: Fix duplicate project-level Hook injection
 Consider running /teamai-share-learnings to summarize what you learned and share it with your team.
 ```
 
-提示会列出实际触发它的非零摩擦信号；如果能取得首个任务摘要，还会在脱敏、单行化后附上任务上下文。`/teamai-share-learnings` skill 自动总结 session 经验并推送到团队仓库。每个 session 最多提示一次。
+提示会列出实际触发它的非零摩擦信号；如果能取得首个任务摘要，还会在脱敏、单行化后附上任务上下文。`/teamai-share-learnings` skill 自动总结 session 经验并推送到团队仓库。每个 session 最多提示一次。团队可在 `teamai.yaml` 设置 `sharing.contributeHint.enabled: false` 关闭该提示（成员可用本地配置 `contributeHintEnabled` 覆盖），Stop hook 的其余功能不受影响。
 
 ### 团队知识检索
 
@@ -223,6 +239,19 @@ teamai codebase --lint                      # 健康检查
 
 WASM 解析器是纯 JavaScript 依赖，无需任何原生编译工具链。若因任何原因加载失败，提取会降级到启发式轨并记录一条 `AST_UNAVAILABLE` gap。设置 `TEAMAI_SKIP_AST=1` 可强制仅使用启发式提取。
 
+## Team Improvement
+
+> Every execution makes the entire team smarter.
+
+洞察团队实际如何使用 AI 工具，也是把 session 中的摩擦转化为共享 Skill、Rule 和知识的起点：
+
+| 能力 | 命令 | 呈现内容 |
+|------|------|----------|
+| **用量（Usage）** | `teamai digest` | 团队周报——token 用量、会话量、干预率。 |
+| **会话（Sessions）** | `teamai session save` | 脱敏的单会话摘要（工具序列、对话轮次、干预次数），喂给周报的 Session Highlights。 |
+| **看板（Dashboard）** | `teamai dashboard` | Web 看板，实时展示成员的编码会话状态、干预次数和 token 用量。 |
+| **知识库健康（KB Health）** | `teamai dashboard` → KB Health | 内置于看板的报告页面，展示知识库使用情况与健康状态——各类型覆盖率、高频召回条目、沉默条目、召回趋势、作者贡献及维护控制台。 |
+
 ## 命令一览
 
 | 命令 | 说明 |
@@ -230,6 +259,7 @@ WASM 解析器是纯 JavaScript 依赖，无需任何原生编译工具链。若
 | `teamai init` | 初始化：OAuth 登录、关联仓库、注册成员、注入 hooks |
 | `teamai pull` | 拉取团队资源并注入到本地 AI 工具 |
 | `teamai push` | 推送本地资源到分支并创建合并请求 |
+| `teamai packages [install] [target]` | 安装团队 npm 包和 Claude 插件。裸 `teamai packages` 安装全部；`teamai packages install <target>` 添加单个并更新声明 |
 | `teamai status` | 显示本地与团队仓库的差异 |
 | `teamai contribute` | 将 session 经验分享到团队仓库 |
 | `teamai recall <query>` | 搜索团队知识库（BM25 + 图谱增强） |
@@ -257,3 +287,13 @@ WASM 解析器是纯 JavaScript 依赖，无需任何原生编译工具链。若
 ## 贡献
 
 欢迎提交 PR！请先阅读 [CONTRIBUTING.md](.github/CONTRIBUTING.md)。
+
+## 贡献者
+
+感谢每一位为 TeamAI 贡献代码的伙伴！
+
+<a href="https://github.com/Tencent/teamai-cli/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Tencent/teamai-cli" alt="Contributors" />
+</a>
+
+由 [contrib.rocks](https://contrib.rocks) 生成。
