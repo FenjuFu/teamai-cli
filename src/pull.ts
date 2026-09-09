@@ -14,7 +14,7 @@ import { loadTagsConfig, filterByTags } from './utils/tags.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import type { GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, TagsConfig } from './types.js';
 import {
-  LEARNINGS_LOCAL_DIR,
+  getUserLearningsDir,
   TEAMAI_CULTURE_START,
   TEAMAI_CULTURE_END,
   TEAMAI_CLAUDEMD_START,
@@ -886,20 +886,20 @@ async function pullForScope(
         if (await pathExists(learningsRepoDir)) {
           // Remove any stale namespace subdirectories no longer active before
           // re-copying, so deactivating a project cleans up its local learnings.
-          if (await pathExists(LEARNINGS_LOCAL_DIR)) {
-            for (const existing of await listDirs(LEARNINGS_LOCAL_DIR)) {
+          if (await pathExists(getUserLearningsDir())) {
+            for (const existing of await listDirs(getUserLearningsDir())) {
               if (!activeLearningsSet.has(existing)) {
-                await fse.remove(path.join(LEARNINGS_LOCAL_DIR, existing));
+                await fse.remove(path.join(getUserLearningsDir(), existing));
               }
             }
           }
-          await fse.copy(learningsRepoDir, LEARNINGS_LOCAL_DIR, {
+          await fse.copy(learningsRepoDir, getUserLearningsDir(), {
             overwrite: true,
             filter: learningsCopyFilter,
           });
           learningsCount = await countLearnings(learningsRepoDir);
         }
-        effectiveLearningsDir = await pathExists(LEARNINGS_LOCAL_DIR) ? LEARNINGS_LOCAL_DIR : undefined;
+        effectiveLearningsDir = await pathExists(getUserLearningsDir()) ? getUserLearningsDir() : undefined;
       } else {
         effectiveLearningsDir = await pathExists(learningsRepoDir) ? learningsRepoDir : undefined;
         if (effectiveLearningsDir) {

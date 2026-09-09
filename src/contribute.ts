@@ -11,7 +11,7 @@ import { markContributed } from './contribute-check.js';
 import { savePendingLearning } from './utils/pending-learnings.js';
 import { isSafeNamespaceSegment, resolveActiveLearningsNamespaces } from './projects.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
-import { LEARNINGS_LOCAL_DIR, getDataHome } from './types.js';
+import { getUserLearningsDir, getDataHome } from './types.js';
 
 /**
  * Rebuild this scope's local search index so the freshly-written contribution
@@ -61,12 +61,12 @@ async function rebuildIndexAfterContribute(localConfig: LocalConfig): Promise<vo
   let effectiveLearningsDir: string | undefined;
   if (localConfig.scope === 'user') {
     if (await pathExists(learningsRepoDir)) {
-      await fse.copy(learningsRepoDir, LEARNINGS_LOCAL_DIR, {
+      await fse.copy(learningsRepoDir, getUserLearningsDir(), {
         overwrite: true,
         filter: (src: string) => !path.basename(src).startsWith('.'),
       });
     }
-    effectiveLearningsDir = (await pathExists(LEARNINGS_LOCAL_DIR)) ? LEARNINGS_LOCAL_DIR : undefined;
+    effectiveLearningsDir = (await pathExists(getUserLearningsDir())) ? getUserLearningsDir() : undefined;
   } else {
     effectiveLearningsDir = (await pathExists(learningsRepoDir)) ? learningsRepoDir : undefined;
   }
@@ -257,7 +257,7 @@ export async function contribute(
  *
  * The user's active working tree is never written to. For immediate local recall,
  * we mirror the worktree's learnings/ (committed main learnings + the new one)
- * into the machine-local LEARNINGS_LOCAL_DIR and index from there — the same
+ * into the machine-local getUserLearningsDir() and index from there — the same
  * pattern user scope uses. The contribution lands in the active tree only when the
  * PR merges and the user pulls.
  */
@@ -300,12 +300,12 @@ async function contributeSelf(
       // worktree — withKnowledgeWorktree deletes wtRepo on teardown, and buildIndex
       // bakes absolute paths into search-index.json, so worktree paths would leave
       // recall printing `File: <deleted>` pointers. learnings come from the
-      // persistent LEARNINGS_LOCAL_DIR mirror; votes from the reports worktree.
+      // persistent getUserLearningsDir() mirror; votes from the reports worktree.
       // This matches the other index-build sites (pull.ts / recall.ts).
       try {
         const { pathExists } = await import('./utils/fs.js');
         const wtLearnings = path.join(wtRepo, 'learnings');
-        await fse.copy(wtLearnings, LEARNINGS_LOCAL_DIR, {
+        await fse.copy(wtLearnings, getUserLearningsDir(), {
           overwrite: true,
           filter: (src: string) => !path.basename(src).startsWith('.'),
         });
@@ -326,7 +326,7 @@ async function contributeSelf(
         const teamaiHome = getDataHome(localConfig);
         const { buildIndex } = await import('./utils/search-index.js');
         await buildIndex({
-          learningsDir: await pathExists(LEARNINGS_LOCAL_DIR) ? LEARNINGS_LOCAL_DIR : undefined,
+          learningsDir: await pathExists(getUserLearningsDir()) ? getUserLearningsDir() : undefined,
           learningsNamespaces: await resolveActiveLearningsNamespaces(repoPath, localConfig.projects ?? []),
           docsDir: await pathExists(docsDir) ? docsDir : undefined,
           rulesDir: await pathExists(rulesDir) ? rulesDir : undefined,
