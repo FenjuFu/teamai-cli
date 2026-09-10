@@ -193,6 +193,9 @@ Device:    PENDING -> ACTIVE -> REVOKED
 Enrollment: PENDING -> APPROVED | DENIED | EXPIRED
 Binding:   ACTIVE -> SUSPENDED -> ACTIVE
            ACTIVE | SUSPENDED -> REVOKED
+Sync:      IDLE -> DOWNLOADED -> APPLYING -> APPLIED
+           APPLYING -> PARTIAL -> APPLYING
+           DOWNLOADED | APPLYING | PARTIAL -> BLOCKED_AUTHORIZATION
 ```
 
 Editing after submission creates a new draft digest and invalidates previous
@@ -249,7 +252,7 @@ resource error. No endpoint accepts a shell command to execute on a member devic
 | POST | `/v1/projects/{id}/learnings` | Create a reviewable learning draft, not an unreviewed release |
 | POST | `/v1/reports/events` | Deduplicate usage, vote and session revisions from the authenticated device |
 | POST | `/v1/secret-resolutions` | Online-only, audited resolution for an authorized device and resource |
-| GET | `/v1/operations/{id}` | Recover mutation outcome after timeout under the same authorization |
+| GET | `/v1/operations/{id}` | Query the client-generated operation ID under the same authorization, including after a lost response |
 | GET | `/v1/audit/events` | Paginated tenant/project audit under audit:read |
 
 All tenant/resource reads re-check membership, including blob downloads, cursor
@@ -280,12 +283,23 @@ project's base revision. Publishing validates those revisions inside the same
 transaction that changes all heads. Clients fetch the new diff and ask the user
 to resolve conflicting resource edits; they never silently overwrite.
 
-**Idempotency.** Mutations require `Idempotency-Key` scoped to organization,
-principal, method, route and target. The server stores the request digest and
-result transactionally for a proposed 24 hours. Repeating the same request returns
-the original result; reusing a key with different content returns
-`409 IDEMPOTENCY_CONFLICT`. An ambiguous timeout is checked through the returned
-operation ID before starting a new mutation. Keys and event IDs survive CLI restarts.
+**Idempotency.** Resource mutations generate and persist `client_operation_id`
+before their first request and use the same value as `Idempotency-Key`. This
+does not add a custom header requirement to OAuth protocol endpoints. IDs are
+scoped to organization, principal, method, route and target. The server stores
+the request digest and durable operation/outcome record in the state-changing
+transaction; its proposed 24-hour HTTP response cache is only a retry optimization.
+A repeated ID with different content returns `409 IDEMPOTENCY_CONFLICT`.
+
+`GET /v1/operations/{id}` accepts that client-generated ID, so reconciliation
+works even when the first response, including every server-generated ID, was lost.
+Clients retry the original ID or query it, never inventing a new ID merely because
+of a timeout or cache expiry. Terminal operation IDs and outcome references remain
+queryable beyond the response-cache lifetime. If outcome retention later expires,
+a compact expired-ID marker remains and returns `410 OPERATION_HISTORY_EXPIRED`.
+The client keeps the pending intent, checks resource revisions/audit evidence and
+requires an explicit reconciled decision before creating a genuinely new operation.
+Unknown or expired history is not proof that the earlier write never happened.
 
 **Pagination and bounds.** List endpoints return `items` and `next_cursor`.
 A signed cursor binds principal, organization, filters and snapshot revision;
@@ -300,7 +314,7 @@ different values. Large operations are staged, then atomically published.
 `request_id` and optional structured conflicting resource IDs. Stable codes
 include `AUTH_REQUIRED` (401), `ACCESS_DENIED` (403),
 `NOT_FOUND` (404, also for hidden cross-tenant objects),
-`CURSOR_EXPIRED` (410), `PAYLOAD_TOO_LARGE` (413),
+`CURSOR_EXPIRED`, `OPERATION_HISTORY_EXPIRED` or `EVENT_WINDOW_EXPIRED` (410), `PAYLOAD_TOO_LARGE` (413),
 `VALIDATION_FAILED` (422), `RATE_LIMITED` (429) and
 `IDENTITY_UNAVAILABLE` (503). Retries honor `Retry-After` with jitter.
 Validation errors never echo secrets, filesystem paths or upstream stack traces.
@@ -358,13 +372,32 @@ cache directory per binding/revision, with a compatible resource tree. It must
 introduce an explicit backend capability/schema extension; it must not pretend to
 be `repo.kind: git` or overload the existing ClawPro `repo.kind: http`.
 
-A sync downloads a manifest and blobs into staging, validates signatures, hashes,
-lengths, authorized resource origins and the complete delete set, then promotes the
-cache pointer atomically under the existing per-workspace synchronization lock.
-Only after promotion does it call the resource handlers and rebuild recall indexes.
-A failed download leaves the old pointer and index intact. Symlinks, absolute
-paths, traversal segments, Windows drive/UNC paths, reserved names and
-case-insensitive name collisions are rejected before writing.
+A sync downloads and verifies the complete manifest, blobs, authorized origins
+and delete set in staging. Atomically promoting this immutable cache sets
+`downloaded_revision`, not `applied_revision`. Local tool configuration files and
+recall indexes span multiple handlers and filesystems; they are not one atomic
+transaction and may temporarily contain a mixture while application runs.
+
+Before touching a destination, persist an apply journal under the workspace lock:
+binding, target revision, operation ID, destination, expected previous hash,
+desired hash/delete, and per-step state. Adapters must expose idempotent per-target
+operations before joining this flow. Each step checks the actual destination hash,
+uses atomic replacement where supported, then records completion. After a crash
+between the write and journal update, a matching desired hash acknowledges the
+already-completed step. A different unowned/user-modified hash becomes a conflict;
+it is never silently overwritten.
+
+A failed handler/index rebuild records `PARTIAL` and retains the journal.
+`applied_revision` and the active recall-index pointer advance only after every
+target operation and index rebuild succeeds. Until then the CLI reports partial
+application, including pending/conflicting targets, and does not claim sync success.
+The previous index may remain usable only while its authorization lease is valid.
+Restart resumes the journal and rechecks authorization before each sensitive step;
+revocation moves it to `BLOCKED_AUTHORIZATION`. Whole-workspace rollback is not
+promised. Download failures leave the previous applied state unchanged.
+
+Symlinks, absolute paths, traversal segments, Windows drive/UNC paths, reserved
+names and case-insensitive name collisions are rejected before writing.
 
 Materialized `teamai.yaml`, `manifest/roles.yaml` and `manifest/projects.yaml`
 are compatibility views derived from authorized server records, not authority
@@ -386,8 +419,13 @@ Multiple providers must share an ownership/arbitration layer before automatic
 fallback is offered. There is no promise that removing an HTTP provider can restore
 another provider's content until that layer is implemented.
 
-Telemetry uses durable event IDs and per-device sequence numbers. Server-side
-deduplication makes retries harmless. Corrections to a resumed session refer to
+Telemetry persists `event_id` and per-device sequence numbers before enqueueing.
+Its deduplication ledger is separate from the HTTP response cache and covers the
+advertised maximum offline window plus the retry window. After ledger compaction,
+expired event IDs/closed sequence windows are rejected with
+`410 EVENT_WINDOW_EXPIRED` and reconciled explicitly; the CLI must not relabel
+old events with new IDs. Durable acknowledgements identify accepted event revisions,
+so retries cannot silently double count. Corrections to a resumed session refer to
 the original event/session and replace its revision rather than incrementing
 successful-session totals again. Learning submissions are reviewable content;
 votes and usage events cannot edit published resources. Offline queues are bounded,
@@ -488,11 +526,11 @@ only with explicit revised dependencies and acceptance evidence.
 | A04 | J3: two organizations, multiple projects and workspaces; unauthorized resources never enter manifests, caches, recall indexes or blob responses |
 | A05 | J4: two-project release concurrent with a membership/head change; all heads change together or none change |
 | A06 | Modify content after approval, replay an idempotency key with a new body, and submit stale ETags; each operation fails with its specified code |
-| A07 | Interrupt each download/promotion/report-ack boundary; retries preserve the old snapshot or apply the new one exactly once |
+| A07 | Interrupt download, cache promotion, each target write, journal acknowledgement and index rebuild; downloaded/applied revisions stay distinct, PARTIAL is visible, and hash-checked recovery never overwrites personal edits |
 | A08 | Revoke users/groups/devices during login, refresh and sync; enforce online checks and the documented offline lease bound |
 | A09 | Malformed archives, invalid hashes/signatures, secret-bearing logs and cross-tenant cursor/blob access are rejected |
 | A10 | Remove/switch/uninstall with personal edits and overlapping sources; preserve unowned files and surface conflicts |
-| A11 | Replay/correct sessions and votes without double counting; expired queues and source permissions are observable |
+| A11 | Lose the first mutation response and replay after the 24-hour response cache expires; recover by client operation ID. Replay/correct telemetry across the supported offline window without double counting; expired history/events require explicit reconciliation |
 | A12 | Restore a backup, rotate keys and replay the outbox; retained releases remain reproducible and no duplicate release appears |
 | A13 | English/Chinese headings, API names, state machines, phases and acceptance IDs remain equivalent |
 

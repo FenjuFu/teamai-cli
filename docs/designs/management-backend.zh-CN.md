@@ -169,6 +169,9 @@ Device:    PENDING -> ACTIVE -> REVOKED
 Enrollment: PENDING -> APPROVED | DENIED | EXPIRED
 Binding:   ACTIVE -> SUSPENDED -> ACTIVE
            ACTIVE | SUSPENDED -> REVOKED
+Sync:      IDLE -> DOWNLOADED -> APPLYING -> APPLIED
+           APPLYING -> PARTIAL -> APPLYING
+           DOWNLOADED | APPLYING | PARTIAL -> BLOCKED_AUTHORIZATION
 ```
 
 提交审核后继续修改会产生新草稿摘要，并使之前审核失效。
@@ -222,7 +225,7 @@ blob hash 验证字节；签名和授权验证谁可以提供和接收这些字�
 | POST | `/v1/projects/{id}/learnings` | 创建可审核 learning 草稿，不直接发布 |
 | POST | `/v1/reports/events` | 去重已认证设备的使用、投票和会话 revision |
 | POST | `/v1/secret-resolutions` | 仅在线、可审计地为授权设备和资源解析密钥 |
-| GET | `/v1/operations/{id}` | 在相同授权条件下恢复超时后的修改结果 |
+| GET | `/v1/operations/{id}` | 在相同授权条件下按客户端预生成操作 ID 查询，首次响应丢失后仍可恢复 |
 | GET | `/v1/audit/events` | 按 audit:read 权限分页查询租户/项目审计 |
 
 所有租户及资源读取都重新检查成员权限，包括 blob 下载、游标翻页、
@@ -252,13 +255,22 @@ blob hash 验证字节；签名和授权验证谁可以提供和接收这些字�
 发布在更新所有 head 的同一事务内再次验证这些 revision。
 客户端获取新差异，请用户解决资源修改冲突，不能静默覆盖。
 
-**幂等。** 修改请求必须携带 `Idempotency-Key`，
-作用域包括组织、主体、方法、路由及目标。
-建议将请求摘要和结果在事务中保存 24 小时。
-相同请求重试返回原结果；同一 key 配合不同内容返回
-`409 IDEMPOTENCY_CONFLICT`。
-遇到结果不明的超时，先用已返回操作 ID 查询状态，再决定是否发起新操作。
-key 和事件 ID 跨 CLI 重启保留。
+**幂等。** 资源修改在首次请求前生成并持久化 `client_operation_id`，
+并将同一值作为 `Idempotency-Key`；不向 OAuth 协议端点附加该自定义 header 要求。
+ID 的作用域包括组织、主体、方法、路由及目标。
+服务端在状态修改事务内保存请求摘要及持久操作/结果记录；
+建议的 24 小时 HTTP 响应缓存仅用于优化重试。
+相同 ID 配合不同内容返回 `409 IDEMPOTENCY_CONFLICT`。
+
+`GET /v1/operations/{id}` 接受这个客户端预生成 ID，因此即使第一次响应及其中所有
+服务端生成的 ID 都丢失，仍可对账。
+客户端重试原 ID 或按原 ID 查询，不能因超时或缓存过期而换一个新 ID。
+终态操作 ID 和结果引用的可查询期限超过响应缓存有效期。
+结果保留期结束后仍保留精简的过期 ID 标记，返回
+`410 OPERATION_HISTORY_EXPIRED`。
+客户端保留待处理意图，对照资源 revision 和审计证据，
+只有经过明确对账决策后才能创建真正的新操作。
+历史未知或过期不等于先前写入从未发生。
 
 **分页与限制。** 列表返回 `items` 和 `next_cursor`。
 签名游标绑定主体、组织、筛选条件和快照 revision，建议有效期为 24 小时。
@@ -271,7 +283,7 @@ key 和事件 ID 跨 CLI 重启保留。
 **资源错误。** 错误响应包含 `error.code`、受长度限制的 `error.message`、
 `request_id`，以及可选的结构化冲突资源 ID。
 稳定错误码包括 `AUTH_REQUIRED`（401）、`ACCESS_DENIED`（403）、
-`NOT_FOUND`（404，也用于隐藏的跨租户对象）、`CURSOR_EXPIRED`（410）、
+`NOT_FOUND`（404，也用于隐藏的跨租户对象）、`CURSOR_EXPIRED`、`OPERATION_HISTORY_EXPIRED` 或 `EVENT_WINDOW_EXPIRED`（410）、
 `PAYLOAD_TOO_LARGE`（413）、`VALIDATION_FAILED`（422）、
 `RATE_LIMITED`（429）和 `IDENTITY_UNAVAILABLE`（503）。
 重试遵循 `Retry-After` 并使用抖动。
@@ -321,10 +333,26 @@ Go 的 `IdentityProvider` 边界将提供方认证标准化为
 提供兼容资源树。实现需要明确的后端 capability/schema 扩展，
 不能伪装成 `repo.kind: git`，也不能复用现有 ClawPro 的 `repo.kind: http` 语义。
 
-同步先将 manifest 和 blob 下载到暂存区，验证签名、hash、长度、
-资源来源权限及完整删除集合，再在现有工作区同步锁内原子切换缓存指针。
-切换成功后才调用资源处理器并重建召回索引。
-下载失败时保留旧指针和旧索引。
+同步先在暂存区下载并验证完整 manifest、blob、来源权限和删除集合。
+原子提升不可变缓存只更新 `downloaded_revision`，不更新 `applied_revision`。
+本地工具配置与召回索引横跨多个处理器和文件系统，不能组成单个原子事务；
+应用期间可能暂时出现新旧内容混合。
+
+修改目标前，在工作区锁内持久化 apply journal，记录绑定、目标 revision、
+操作 ID、目标路径、预期旧 hash、新 hash/删除操作及每步状态。
+适配器只有具备可幂等执行的逐目标操作后才能接入该流程。
+每步检查目标的实际 hash，在支持的地方使用原子替换，再记录完成状态。
+若写入后、journal 更新前崩溃，恢复时目标匹配新 hash 即确认该步已完成。
+不匹配且属于非受管内容或用户修改的 hash 必须成为冲突，不能静默覆盖。
+
+处理器或索引重建失败时记录 `PARTIAL` 并保留 journal。
+只有全部目标操作及索引重建成功后，才推进 `applied_revision` 和活跃召回索引指针。
+在此之前 CLI 展示部分应用状态及待处理/冲突目标，不宣称同步成功。
+旧索引只有在其授权租约仍有效时才可继续使用。
+重启后从 journal 恢复，并在每个敏感操作前重新检查授权；
+撤销后转为 `BLOCKED_AUTHORIZATION`。
+不承诺整个工作区回滚。下载失败保持原已应用状态。
+
 写盘前拒绝符号链接、绝对路径、路径穿越、Windows 盘符/UNC 路径、
 保留名称及大小写不敏感名称冲突。
 
@@ -346,7 +374,11 @@ ownership ledger 记录 provider、绑定、资源 ID/版本、目标路径和�
 自动回退到其他来源前，多个 provider 必须共用 ownership 和冲突裁决层。
 在该层实现之前，不能承诺移除 HTTP provider 后会恢复其他 provider 的内容。
 
-遥测使用持久事件 ID 和每设备序号，服务端去重使重试无副作用。
+遥测在入队前持久化 `event_id` 和每设备序号。
+其去重 ledger 独立于 HTTP 响应缓存，保留期覆盖公布的最长离线窗口及重试窗口。
+ledger 压缩后，过期事件 ID/已关闭序号窗口返回
+`410 EVENT_WINDOW_EXPIRED`，要求明确对账；CLI 不能给旧事件换新 ID。
+持久确认标识已接收的事件 revision，避免重试静默重复计数。
 恢复会话后的修正引用原事件/会话并替换其 revision，
 不能再次递增成功会话总数。
 Learning 属于可审核内容；投票和使用事件不能编辑已发布资源。
@@ -442,11 +474,11 @@ P2 是只读试点，不是 Git 的完整替代。
 | A04 | J3：两个组织、多个项目和工作区；未授权资源不能进入 manifest、缓存、召回索引或 blob 响应 |
 | A05 | J4：双项目发布期间并发改变成员权限/head；全部 head 同时改变或全部不变 |
 | A06 | 审核后修改内容、用新请求体重用幂等 key、提交过期 ETag；按约定错误码拒绝 |
-| A07 | 中断每个下载/指针切换/上报确认边界；重试保留旧快照或恰好一次应用新快照 |
+| A07 | 中断下载、缓存提升、每个目标写入、journal 确认及索引重建；区分 downloaded/applied revision，展示 PARTIAL，按 hash 恢复且不覆盖个人修改 |
 | A08 | 登录、刷新、同步过程中撤销用户/用户组/设备；执行在线检查及文档规定的离线租约边界 |
 | A09 | 拒绝畸形归档、无效 hash/签名、含密钥日志及跨租户游标/blob 访问 |
 | A10 | 有个人修改和重叠来源时删除/切换/卸载；保留非受管文件并展示冲突 |
-| A11 | 会话和投票重放/修正不重复计数；过期队列及来源权限状态可观察 |
+| A11 | 丢失首次修改响应，并在 24 小时响应缓存过期后重放；按客户端操作 ID 恢复。跨支持的离线窗口重放/修正遥测不重复计数，历史/事件过期后必须明确对账 |
 | A12 | 备份恢复、密钥轮换和 outbox 重放；保留的 release 可复现且不会重复发布 |
 | A13 | 中英章节、API 名称、状态机、阶段及验收 ID 等价 |
 
