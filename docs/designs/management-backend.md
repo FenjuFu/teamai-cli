@@ -266,6 +266,7 @@ operations; deletion is a first-class operation rather than omission:
 
 ```json
 {
+  "client_operation_id": "op_client_001",
   "projects": [{"project_id": "prj_a", "base_revision": "rev_a_24"}],
   "operations": [
     {"op": "put", "project_id": "prj_a", "type": "skills",

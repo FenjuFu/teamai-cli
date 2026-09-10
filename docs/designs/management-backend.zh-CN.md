@@ -238,6 +238,7 @@ blob hash 验证字节；签名和授权验证谁可以提供和接收这些字�
 
 ```json
 {
+  "client_operation_id": "op_client_001",
   "projects": [{"project_id": "prj_a", "base_revision": "rev_a_24"}],
   "operations": [
     {"op": "put", "project_id": "prj_a", "type": "skills",
